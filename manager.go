@@ -11,26 +11,108 @@ import (
 
 // Manager 维护所有隧道，负责分配槽位与端口。
 type Manager struct {
-	mu       sync.RWMutex
-	tunnels  map[int]*Tunnel
-	nodes    []Node
-	fetched  time.Time
-	workDir  string
-	maxSlots int
-	jobs     JobStore
+	mu        sync.RWMutex
+	refreshMu sync.Mutex // 串行化节点列表刷新（见 RefreshNodes）
+	tunnels   map[int]*Tunnel
+	nodes     []Node
+	fetched   time.Time
+	// stats 是最近一轮各源的拉取结果，只用于日志与界面诊断
+	stats []sourceStat
+	// sourceCounts 记住每个源上一轮各自返了多少节点，用作下一轮“骤减”
+	// 判断的基准（按 URL 各自比；合并后的总数比单源大得多，不能混用）。
+	sourceCounts map[string]int
+	mirrors      *mirrorStore
+	workDir      string
+	maxSlots     int
+	jobs         JobStore
 }
 
 func NewManager(maxSlots int, workDir string) *Manager {
 	return &Manager{
-		tunnels:  map[int]*Tunnel{},
-		workDir:  workDir,
-		maxSlots: maxSlots,
+		tunnels:      map[int]*Tunnel{},
+		workDir:      workDir,
+		maxSlots:     maxSlots,
+		mirrors:      newMirrorStore(workDir),
+		sourceCounts: map[string]int{},
 	}
 }
 
-// RefreshNodes 重新拉取节点列表。
+// RefreshNodes 多源拉取并合并节点列表。
+//
+// 任一源成功即算成功；全部失败时返回错误并且不动 m.nodes，
+// 保留上一轮的列表（这个语义改动前就有，多源后必须保持）。
+//
+// refreshMu 串行化整轮：启动后的后台聚合、12 小时 ticker、重连退避前的
+// 刷新、手动接口可能撞在一起。并发跑两轮不会错，但会白白多打一轮带宽，
+// 还会把轮转偏移一次跳两格。
 func (m *Manager) RefreshNodes() (int, error) {
-	nodes, err := fetchNodes(60 * time.Second)
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+
+	timeout := nodeFetchTimeout()
+	m.mu.RLock()
+	prev := len(m.nodes)
+	prevByURL := make(map[string]int, len(m.sourceCounts))
+	for u, c := range m.sourceCounts {
+		prevByURL[u] = c
+	}
+	m.mu.RUnlock()
+
+	// 经 NewManager 构造的都有 mirrorStore；手构的 Manager（测试里）退回单源。
+	sources := []string{vpngateAPI}
+	if m.mirrors != nil {
+		sources = m.mirrors.sources(time.Now(), timeout)
+	}
+	nodes, stats, err := fetchAggregated(sources, timeout, prevByURL)
+	if err != nil {
+		// 失败也要把各源结果存下来：界面要能看出是“三个源都拉不动”还是“只有主站挂了”
+		m.mu.Lock()
+		m.stats = stats
+		m.mu.Unlock()
+		if m.mirrors != nil {
+			m.mirrors.noteFailure(time.Now())
+		}
+		log.Printf("节点列表刷新失败（%d 个源全部不可用）: %v", len(stats), err)
+		for _, s := range stats {
+			log.Printf("  源 %s: %s", s.URL, s.Err)
+		}
+		return 0, err
+	}
+	ok := 0
+	counts := make(map[string]int, len(stats))
+	for _, s := range stats {
+		if s.Err == "" {
+			ok++
+			counts[s.URL] = s.Nodes
+		}
+	}
+	m.mu.Lock()
+	m.nodes = nodes
+	m.fetched = time.Now()
+	m.stats = stats
+	// 只记成功源的数：失败源没有可信基准，拿它比会把正常波动当成异常
+	m.sourceCounts = counts
+	m.mu.Unlock()
+	mirrors, _ := m.MirrorSummary()
+	log.Printf("节点列表刷新完成：源 %d/%d 成功，合并后 %d 个节点（上一轮 %d），镜像列表缓存 %d 个",
+		ok, len(stats), len(nodes), prev, mirrors)
+	// 部分成功时也要把挂掉的源和原因打出来。“源 1/3”不告诉你剩下两个是
+	// “镜像站本身挂了”还是“这台机器到不了非 80/443 的明文端口”，
+	// 而这两种情况的处理办法完全不同。
+	for _, s := range stats {
+		if s.Err != "" {
+			log.Printf("  源 %s 未取到（%dms）: %s", s.URL, s.MS, s.Err)
+		}
+	}
+	return len(nodes), nil
+}
+
+// RefreshMainNodes 只拉主站（失败退到自建反代），即多源之前的单源行为。
+//
+// 启动时用：节点池能在一个单源超时内就位，而 restoreState 不必排在
+// 多源拉取后面 —— 后者最坏能把所有出口隧道的恢复推迟近一分钟。
+func (m *Manager) RefreshMainNodes() (int, error) {
+	nodes, err := fetchNodes(nodeFetchTimeout())
 	if err != nil {
 		return 0, err
 	}
@@ -39,6 +121,58 @@ func (m *Manager) RefreshNodes() (int, error) {
 	m.fetched = time.Now()
 	m.mu.Unlock()
 	return len(nodes), nil
+}
+
+// WarmNodePool 在后台补一轮多源聚合，把池子从“只有主站那一百来个”扩开。
+// 启动路径调它，所以出口恢复不等镜像。
+func (m *Manager) WarmNodePool() {
+	if n, err := m.RefreshNodes(); err != nil {
+		log.Printf("后台聚合节点列表失败: %v", err)
+	} else {
+		log.Printf("后台聚合完成：%d 个节点", n)
+	}
+}
+
+// nodeRefreshInterval 是定时刷新的间隔。取 12 小时而不是十几分钟：
+// 镜像本身有缓存，连续拉同一个返回逐字节相同的响应。
+const nodeRefreshInterval = 12 * time.Hour
+
+// WatchNodes 每 12 小时刷新一轮节点列表。
+//
+// 没有这个定时器时，刷新只发生在启动、“自动重连且一整轮候选全挂”、
+// 以及手动接口三处。出口都正常的机器永远不会触发前者，于是池子会
+// 随时间单调变旧（聚合又会带入更多缓存快照里的节点）。
+//
+// 定时刷新不碰 notifyPanel：节点列表变化不影响 Xray 配置，
+// 只有隧道集合变化才影响。
+func (m *Manager) WatchNodes() {
+	t := time.NewTicker(nodeRefreshInterval)
+	defer t.Stop()
+	for range t.C {
+		n, err := m.RefreshNodes()
+		if err != nil {
+			log.Printf("定时刷新节点列表失败: %v", err)
+			continue
+		}
+		log.Printf("定时刷新节点列表：当前 %d 个", n)
+	}
+}
+
+// NodeSources 返回最近一轮各源的拉取结果。
+func (m *Manager) NodeSources() []sourceStat {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]sourceStat, len(m.stats))
+	copy(out, m.stats)
+	return out
+}
+
+// MirrorSummary 返回镜像列表缓存数与列表页上次更新时间。
+func (m *Manager) MirrorSummary() (int, time.Time) {
+	if m.mirrors == nil {
+		return 0, time.Time{}
+	}
+	return m.mirrors.summary()
 }
 
 func (m *Manager) Nodes() ([]Node, time.Time) {

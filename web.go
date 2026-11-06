@@ -256,6 +256,11 @@ textarea:focus{outline:none;border-color:var(--accent)}
         <input type="search" id="rgfilter" placeholder="筛选地区">
         <div class="regions" id="regions" style="margin-top:6px"></div>
       </label>
+      <div class="hint" id="rgfetched"></div>
+      <button id="rgrefresh" title="重新拉取 VPN Gate 节点列表（主站 + 镜像）">
+        <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+        刷新节点列表
+      </button>
       <label class="f">
         <span id="countlabel">数量</span>
         <div class="stepper">
@@ -754,8 +759,10 @@ function updateAvail(){
 
 async function loadWizard(){
   try{
-    regions = await api('/api/regions') || [];
+    const r = await api('/api/regions') || {};
+    regions = r.regions || [];
     regionsLoaded = true;
+    showFetched(r);
     renderRegions();
   }catch(e){ toast('读取地区失败: ' + e.message, true); }
 
@@ -880,6 +887,41 @@ $('#ncreate').onclick = async e => {
 };
 
 $('#rgfilter').oninput = renderRegions;
+
+// 节点列表新鲜度。多源聚合后池子会随轮转变化，不显示上次拉取时间与
+// 各源成败，用户就分不清“这个地区多了很多候选”是刷新带来的还是列表过期了。
+function showFetched(r){
+  const el = $('#rgfetched');
+  if(!el) return;
+  const iso = String(r.fetched || '');
+  if(!iso || iso.startsWith('0001')){ el.textContent = '还没有拉取过节点列表'; return; }
+  const src = r.sources || [];
+  const bits = ['节点列表 ' + new Date(iso).toLocaleString()];
+  if(src.length) bits.push('源 ' + src.filter(s => !s.err).length + '/' + src.length);
+  if(r.mirror_count) bits.push('镜像 ' + r.mirror_count + ' 个');
+  el.textContent = bits.join(' · ');
+}
+
+function rgBusy(on){
+  const b = $('#rgrefresh');
+  if(!b) return;
+  b.disabled = on;
+  b.innerHTML = (on ? ICON.run : ICON.redo) + ' 刷新节点列表';
+}
+
+$('#rgrefresh').onclick = async () => {
+  // 一轮多源最坏要一两分钟（每源 25s 超时、并发 3），以前提前点会重复发请求
+  rgBusy(true);
+  try{
+    const r = await api('/api/refresh', {method:'POST'});
+    toast('已刷新：' + ((r && r.count) || 0) + ' 个节点');
+  }catch(err){
+    toast('刷新失败: ' + err.message, true);
+  }
+  // 失败也要重读：那个接口会带回哪几个源挂了、各自是什么原因
+  await loadWizard();
+  rgBusy(false);
+};
 $('#minus').onclick = () => { step(-1); };
 $('#plus').onclick = () => { step(1); };
 function step(d){

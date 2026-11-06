@@ -80,8 +80,10 @@ func main() {
 	}
 
 	mgr := NewManager(*maxSlots, *workDir)
+	// 启动先只拉主站：节点池在一个单源超时内就位，而隧道恢复不被多源拉取拖住。
+	// 镜像在后台补（见下面的 WarmNodePool）。
 	log.Printf("正在拉取节点列表...")
-	if n, err := mgr.RefreshNodes(); err != nil {
+	if n, err := mgr.RefreshMainNodes(); err != nil {
 		log.Printf("拉取失败（可在 Web 界面重试）: %v", err)
 	} else {
 		log.Printf("已获取 %d 个节点", n)
@@ -96,7 +98,11 @@ func main() {
 		go mgr.ReconcileOutbounds()
 	}
 
+	// 恢复已经起步，这之后才把镜像源补上
+	go mgr.WarmNodePool()
+
 	go mgr.WatchHealth()
+	go mgr.WatchNodes()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -192,6 +198,7 @@ func apiNodes(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		nodes, fetched := m.Nodes()
 		total := len(nodes)
+		mirrors, mirrorFetched := m.MirrorSummary()
 		// 默认跟挑节点的口径一致：开了"只用家宽"就不列机房节点。
 		// 带 all=1 能看到完整列表，用来确认过滤掉了多少。
 		if residentialOnly() && r.URL.Query().Get("all") != "1" {
@@ -213,6 +220,10 @@ func apiNodes(m *Manager) http.HandlerFunc {
 			"total":            total,
 			"available":        shown,
 			"residential_only": residentialOnly(),
+			// 最近一轮各源的结果与镜像列表缓存，用来判断聚合有没有在工作
+			"sources":        m.NodeSources(),
+			"mirror_count":   mirrors,
+			"mirror_fetched": mirrorFetched,
 		})
 	}
 }
@@ -265,10 +276,17 @@ func apiRefresh(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n, err := m.RefreshNodes()
 		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			// 带上各源的失败原因，否则界面只能看到一个笼统的错误
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error":   err.Error(),
+				"sources": m.NodeSources(),
+			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]int{"count": n})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"count":   n,
+			"sources": m.NodeSources(),
+		})
 	}
 }
 
@@ -289,9 +307,20 @@ func apiSwap(m *Manager) http.HandlerFunc {
 }
 
 // apiRegions 给新建向导用：各地区还剩多少空闲节点。
+//
+// 外面包一层：向导里的“刷新节点”按钮要就地显示上次拉取时间与各源结果，
+// 另开一个接口只会多一次往返。
 func apiRegions(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, m.Regions())
+		_, fetched := m.Nodes()
+		mirrors, mirrorFetched := m.MirrorSummary()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"regions":        m.Regions(),
+			"fetched":        fetched,
+			"sources":        m.NodeSources(),
+			"mirror_count":   mirrors,
+			"mirror_fetched": mirrorFetched,
+		})
 	}
 }
 

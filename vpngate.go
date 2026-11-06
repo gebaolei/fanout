@@ -5,16 +5,20 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-const vpngateAPI = "https://www.vpngate.net/api/iphone/"
+// vpngateAPI 是节点列表接口。写成 var 是为了测试能把主站指向 httptest，
+// 跟 fetchNodesWith 把直连地址拆成参数是同一个思路。
+var vpngateAPI = "https://www.vpngate.net/api/iphone/"
 
 // vpngateMirror 是直连拿不到节点列表时的兜底（Cloudflare Worker 反代）。
 // 用 FANOUT_VPNGATE_MIRROR 可以换成自己的地址，设成空字符串就只走直连。
@@ -80,11 +84,27 @@ func isResidential(hostName, ip string) bool {
 	return true
 }
 
-// fetchNodes 拉取并解析 VPN Gate 的节点列表。
+// fetchNodes 拉取并解析 VPN Gate 的节点列表（单源）。
 // 先直连；连不上或者拿回来的内容不对（被拦截、返回门户页）就换反代再试一次。
 // 返回的列表已按速度降序排列。
+//
+// 启动时走这条路（同步、不拉镜像，不拖慢隧道恢复）；
+// 运行期的多源聚合走 fetchAggregated。
 func fetchNodes(timeout time.Duration) ([]Node, error) {
 	return fetchNodesWith(vpngateAPI, timeout)
+}
+
+// nodeFetchTimeout 是单个源的超时，不是整轮的超时。
+// 多个源并发，所以整轮耗时基上就等于这个值。
+// 注意 http.Client.Timeout 覆盖的是整个请求（含读 body）：
+// 实测 46 KB/s 的链路上 1.3 MB 要 30 秒，带宽差的机器要调大。
+func nodeFetchTimeout() time.Duration {
+	if v, ok := os.LookupEnv("FANOUT_VPNGATE_TIMEOUT"); ok {
+		if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 25 * time.Second
 }
 
 // fetchNodesWith 把直连地址拆成参数，方便测试两条分支。
@@ -105,7 +125,7 @@ func fetchNodesWith(direct string, timeout time.Duration) ([]Node, error) {
 }
 
 func fetchNodesFrom(url, key string, timeout time.Duration) ([]Node, error) {
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{Timeout: timeout, Transport: nodeTransport}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("拉取节点列表失败: %w", err)
@@ -121,11 +141,134 @@ func fetchNodesFrom(url, key string, timeout time.Duration) ([]Node, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("拉取节点列表失败: HTTP %d", resp.StatusCode)
 	}
-	raw, err := io.ReadAll(resp.Body)
+	// 多读 1 字节用来判断超限：直接 LimitReader 到上限会把半截列表
+	// 当成完整列表写进 m.nodes（parseNodeCSV 对结束标记 `*` 是跳过、不校验）。
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, csvMaxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("读取节点列表失败: %w", err)
 	}
+	if len(raw) > csvMaxBytes {
+		return nil, fmt.Errorf("节点列表超过 %d 字节，按异常处理", csvMaxBytes)
+	}
 	return parseNodeCSV(string(raw))
+}
+
+// sourceStat 是一个源的拉取结果，日志与界面诊断用。
+type sourceStat struct {
+	URL   string `json:"url"`
+	Nodes int    `json:"nodes"`
+	MS    int64  `json:"ms"`
+	Err   string `json:"err,omitempty"`
+}
+
+// 并发 3：主站 + 2 个镜像一个波次拉完，最坏就是一个单源超时。
+// 并发 2 会多出一个波次，最坏耗时翻倍，而 3 个并发对上游不构成压力。
+const maxSourceWorkers = 3
+
+// 单个源至少要有多少个节点才算正常。实测单站是 97~101。
+const minNodesPerSource = 20
+
+// fetchAggregated 并发拉多个源，按 hostname 去重合并。
+//
+// sources[0] 视为主站：它失败时会像以前一样退到自建反代。
+// prevByURL 是上一轮每个源各自返回的节点数，用于“骤减”判断；
+// 首轮或新出现的源传空 map。不能用合并后的总数当基准：
+// 单源只返 ~100 个，合并后是 277，拿 277 去卡单源会把所有源全判成异常。
+// 只要有一个源成功就返回结果；全部失败才报错，调用方保留旧列表。
+func fetchAggregated(sources []string, timeout time.Duration, prevByURL map[string]int) ([]Node, []sourceStat, error) {
+	if len(sources) == 0 {
+		return nil, nil, fmt.Errorf("没有可用的节点源")
+	}
+	per := make([][]Node, len(sources))
+	stats := make([]sourceStat, len(sources))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxSourceWorkers)
+	for i, u := range sources {
+		wg.Add(1)
+		go func(i int, u string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			stats[i].URL = u
+			t0 := time.Now()
+			nodes, err := fetchOneSource(i, u, timeout, prevByURL[u])
+			stats[i].MS = time.Since(t0).Milliseconds()
+			if err != nil {
+				stats[i].Err = err.Error()
+				return
+			}
+			stats[i].Nodes = len(nodes)
+			per[i] = nodes
+		}(i, u)
+	}
+	wg.Wait()
+	merged := mergeNodeSources(per)
+	if len(merged) == 0 {
+		return nil, stats, fmt.Errorf("所有节点源都失败")
+	}
+	return merged, stats, nil
+}
+
+// fetchOneSource 拉一个源。i==0 是主站，失败时要退到自建反代（既有语义）。
+func fetchOneSource(i int, url string, timeout time.Duration, prevCount int) ([]Node, error) {
+	var nodes []Node
+	var err error
+	if i == 0 {
+		nodes, err = fetchNodesWith(url, timeout)
+	} else {
+		nodes, err = fetchNodesFrom(url, "", timeout)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := nodeCountPlausible(len(nodes), prevCount); err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// nodeCountPlausible 是数量合理性检查，不能省。
+//
+// 传输层中断时 io.ReadAll 会报 unexpected EOF；但上游或中间人给出一个
+// “更短但完整”的响应时，parseNodeCSV 完全成功、不报错，残缺列表会直接
+// 写进 m.nodes，表现为池子凭空小一半。只能靠数量兜底。
+//
+// prev 是同一个源上一轮的数量（不是合并后的总数）：每站规模各自稳,
+// 跨站比没意义。
+func nodeCountPlausible(n, prev int) error {
+	if n < minNodesPerSource {
+		return fmt.Errorf("节点数过少(%d)，按异常处理", n)
+	}
+	if prev > 0 && n*2 < prev {
+		return fmt.Errorf("节点数比上一轮(%d)少一半以上，按异常处理", prev)
+	}
+	return nil
+}
+
+// mergeNodeSources 按 hostname 去重合并，靠前的源优先。
+//
+// 主站是实时生成的，镜像是缓存快照：实测 37/291 个节点在镜像里的
+// Score/Ping/Speed 与主站不一致且是旧值，所以两边都有时要用主站的。
+// 实测 7 个源里 hostname 与 IP 一一对应（多 IP 数 = 0），所以拿 hostname
+// 当键是安全的；真撞上不一致就沿用优先级高的那条，不去猜。
+func mergeNodeSources(perSource [][]Node) []Node {
+	at := map[string]int{}
+	var out []Node
+	for _, list := range perSource {
+		for _, n := range list {
+			if i, ok := at[n.HostName]; ok {
+				if out[i].IP != n.IP {
+					log.Printf("节点 %s 在不同源里 IP 不一致（%s / %s），沿用 %s",
+						n.HostName, out[i].IP, n.IP, out[i].IP)
+				}
+				continue
+			}
+			at[n.HostName] = len(out)
+			out = append(out, n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SpeedMbps > out[j].SpeedMbps })
+	return out
 }
 
 // parseNodeCSV 解析 VPN Gate 的 CSV。首行是 "*vpn_servers"，
