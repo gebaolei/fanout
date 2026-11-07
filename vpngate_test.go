@@ -348,6 +348,33 @@ func TestFetchAggregatedWorkerFallbackIsMainOnly(t *testing.T) {
 }
 
 // 超限的响应必须丢，不能把半截列表当成完整列表。
+func TestParseNodeCSVRejectsHTML(t *testing.T) {
+	// 限流和拦截页也是 HTTP 200，但正文是 HTML。报错要能看出是这回事，
+	// 而不是「bare " in non-quoted-field」这种得倒推的提法。
+	body := "<!DOCTYPE html><html lang=\"zh-CN\"><head><title>Too Many Requests</title></head></html>\n"
+	_, err := parseNodeCSV(body)
+	if err == nil {
+		t.Fatal("HTML 应当报错")
+	}
+	if !strings.Contains(err.Error(), "不是节点列表") {
+		t.Fatalf("报错应当说明返回的不是节点列表: %v", err)
+	}
+	if !strings.Contains(err.Error(), "<!DOCTYPE html>") {
+		t.Fatalf("报错里该带上首行预览: %v", err)
+	}
+}
+
+func TestParseNodeCSVAcceptsLeadingBlankLines(t *testing.T) {
+	body := "\r\n\r\n" + sampleNodeCSVN("a", 24)
+	nodes, err := parseNodeCSV(body)
+	if err != nil {
+		t.Fatalf("开头的空行不该影响解析: %v", err)
+	}
+	if len(nodes) != 24 {
+		t.Fatalf("应当解析出 24 个，实际 %d", len(nodes))
+	}
+}
+
 func TestFetchNodesFromDoesNotAskForGzip(t *testing.T) {
 	// 官方镜像站对带 Accept-Encoding: gzip 的请求会先回 200 再一个字节都不发，
 	// 挂到客户端超时。Go 的默认 Transport 会自动加这个头，不关掉就等于

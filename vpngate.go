@@ -165,6 +165,24 @@ type sourceStat struct {
 // 并发 2 会多出一个波次，最坏耗时翻倍，而 3 个并发对上游不构成压力。
 const maxSourceWorkers = 3
 
+// csvHeadLine 返第一个非空行（去 BOM）以及它是不是 VPN Gate 的开头标记。
+// 后面那截只用于报错预览，压成一行并截短，避免把整页 HTML 灌进日志。
+func csvHeadLine(body string) (string, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimLeft(line, "\ufeff"), "\ufeff"))
+		if line == "" {
+			continue
+		}
+		preview := strings.Join(strings.Fields(line), " ")
+		r := []rune(preview)
+		if len(r) > 60 {
+			preview = string(r[:60]) + "…"
+		}
+		return preview, strings.EqualFold(line, "*vpn_servers")
+	}
+	return "", false
+}
+
 // 单个源至少要有多少个节点才算正常。实测单站是 97~101。
 const minNodesPerSource = 20
 
@@ -274,6 +292,12 @@ func mergeNodeSources(perSource [][]Node) []Node {
 // parseNodeCSV 解析 VPN Gate 的 CSV。首行是 "*vpn_servers"，
 // 第二行是以 '#' 开头的表头，末行是 "*"。
 func parseNodeCSV(body string) ([]Node, error) {
+	// 先确认首行。限流或中间拦截页也是 HTTP 200，但返的是 HTML，
+	// 直接丢进 csv 只会得到「bare " in non-quoted-field」这种看不出
+	// 所以然的报错（<!DOCTYPE html><html lang="..." 的引号正好落在 22~23 列）。
+	if head, ok := csvHeadLine(body); !ok {
+		return nil, fmt.Errorf("返回的不是节点列表（首行 %q，疑似限流或拦截页）", head)
+	}
 	var kept []string
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimRight(line, "\r")

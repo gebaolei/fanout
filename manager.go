@@ -16,6 +16,9 @@ type Manager struct {
 	tunnels   map[int]*Tunnel
 	nodes     []Node
 	fetched   time.Time
+	// lastTry 是最近一次发起拉取的时间（不论成败），给重连循环里的冷却用。
+	// 不能用 fetched：全部源失败时 fetched 不动，冷却就失效了。
+	lastTry time.Time
 	// stats 是最近一轮各源的拉取结果，只用于日志与界面诊断
 	stats []sourceStat
 	// sourceCounts 记住每个源上一轮各自返了多少节点，用作下一轮“骤减”
@@ -50,6 +53,10 @@ func (m *Manager) RefreshNodes() (int, error) {
 	defer m.refreshMu.Unlock()
 
 	timeout := nodeFetchTimeout()
+	m.mu.Lock()
+	m.lastTry = time.Now()
+	m.mu.Unlock()
+
 	m.mu.RLock()
 	prev := len(m.nodes)
 	prevByURL := make(map[string]int, len(m.sourceCounts))
@@ -105,6 +112,23 @@ func (m *Manager) RefreshNodes() (int, error) {
 		}
 	}
 	return len(nodes), nil
+}
+
+// retryRefresh 是重连循环里的节点列表刷新：maxAge 内已经拉过就直接跳过。
+//
+// 不加这个冷却的话，一条连不上的隧道每轮重试都要打一轮三个源：实测一小时
+// 上百次，把主站和自建反代都打进限流（主站改回 HTML、反代直回 429），
+// 等到真需要刷新列表时反而刷不动。而候选节点在这一分钟内根本不会变。
+func (m *Manager) retryRefresh(maxAge time.Duration) {
+	m.mu.RLock()
+	last := m.lastTry
+	m.mu.RUnlock()
+	if !last.IsZero() && time.Since(last) < maxAge {
+		return
+	}
+	if _, err := m.RefreshNodes(); err != nil {
+		log.Printf("重试前刷新节点列表失败: %v", err)
+	}
 }
 
 // RefreshMainNodes 只拉主站（失败退到自建反代），即多源之前的单源行为。
@@ -251,12 +275,20 @@ func (m *Manager) bringUp(t *Tunnel, notify bool) {
 	m.bringUpPersist(t, notify, false)
 }
 
-// 自动重连的退避区间：一轮候选全挂后等一会儿再刷新节点列表重来，
-// 别把死节点列表打爆，也别让恢复拖太久。
+// 自动重连的退避区间：一轮候选全挂后等一会儿再重试。
+//
+// 上限取 5 分钟而不是 60 秒：一条连不上的隧道会一直循环，60 秒封顶时
+// 每小时要跑三十多轮，每轮还要打一轮节点列表（实测主站和自建反代
+// 都被这样打进限流：主站回 HTML、反代回 429），而候选列表在 1 分钟内
+// 不会变。头几轮仍然是 5/10/20/40/80/160 秒，真故障仍能快速重试。
 const (
 	reconnectBackoffMin = 5 * time.Second
-	reconnectBackoffMax = 60 * time.Second
+	reconnectBackoffMax = 5 * time.Minute
 )
+
+// refreshRetryCooldown 是重连循环里两次拉取节点列表的最小间隔。
+// 重连靠的是换候选节点，不是换列表；列表本身 12 小时才需要刷一轮。
+const refreshRetryCooldown = 10 * time.Minute
 
 // bringUpPersist 把一条隧道拉起来。
 //
@@ -284,14 +316,12 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 
 		t.Status = "starting"
 		t.Err = fmt.Sprintf("暂无可用节点，%.0f 秒后重试", backoff.Seconds())
-		log.Printf("隧道 %d 一轮候选均失败，%.0f 秒后刷新节点重试", t.Slot, backoff.Seconds())
+		log.Printf("隧道 %d 一轮候选均失败，%.0f 秒后重试", t.Slot, backoff.Seconds())
 		time.Sleep(backoff)
 		if !m.tunnelActive(t) {
 			return
 		}
-		if _, err := m.RefreshNodes(); err != nil {
-			log.Printf("重试前刷新节点列表失败: %v", err)
-		}
+		m.retryRefresh(refreshRetryCooldown)
 		if backoff < reconnectBackoffMax {
 			backoff *= 2
 			if backoff > reconnectBackoffMax {

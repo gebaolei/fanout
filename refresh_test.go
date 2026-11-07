@@ -1,8 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -144,6 +148,59 @@ func TestConcurrentRefreshDoesNotTearTheList(t *testing.T) {
 	wg.Wait()
 	if len(m.nodes) != 30 {
 		t.Fatalf("最终列表应当是 30 个，实际 %d", len(m.nodes))
+	}
+}
+
+// 重连循环里的刷新必须受冷却控制：一条连不上的隧道每轮重试都刷一轮的话，
+// 一小时上百次请求会把主站和自建反代打进限流，真需要刷新时反而刷不动。
+func TestRetryRefreshHonoursCooldown(t *testing.T) {
+	noMirrors(t)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, sampleNodeCSVN("m", 30))
+	}))
+	defer srv.Close()
+	useMainFeed(t, srv.URL)
+
+	m := NewManager(20, t.TempDir())
+	for i := 0; i < 3; i++ {
+		m.retryRefresh(10 * time.Minute)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("冷却内只该拉一次，实际 %d 次", n)
+	}
+
+	m.mu.Lock()
+	m.lastTry = time.Now().Add(-11 * time.Minute)
+	m.mu.Unlock()
+	m.retryRefresh(10 * time.Minute)
+	if n := hits.Load(); n != 2 {
+		t.Fatalf("冷却过了应当再拉一次，实际 %d 次", n)
+	}
+}
+
+// 全部源失败时 m.fetched 不会更新，冷却必须记在“发起过拉取”上。
+// 否则主站被限流的那段时间会被越打越凶 —— 正是现场看到的那个问题。
+func TestRetryRefreshCooldownSurvivesTotalFailure(t *testing.T) {
+	noMirrors(t)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	useMainFeed(t, srv.URL)
+
+	m := NewManager(20, t.TempDir())
+	for i := 0; i < 4; i++ {
+		m.retryRefresh(10 * time.Minute)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("全失败时也只该拉一次，实际 %d 次", n)
+	}
+	if !m.fetched.IsZero() {
+		t.Fatal("失败不该更新 fetched（所以冷却靠 lastTry）")
 	}
 }
 
