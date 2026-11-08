@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -414,5 +415,38 @@ func TestNodeFetchTimeout(t *testing.T) {
 	t.Setenv("FANOUT_VPNGATE_TIMEOUT", "0")
 	if got := nodeFetchTimeout(); got != 25*time.Second {
 		t.Errorf("非法值应当退回默认，实际 %v", got)
+	}
+}
+
+// TestLiveNodeConfigCoverage 数一下源站列表里有多少节点其实没带 .ovpn。
+//
+// 真机上撞到过这么一行：
+//
+//	出口 4 候选 vpn200460917（）连不上: 节点 vpn200460917 没有 .ovpn 配置
+//
+// 这种节点永远连不上，却照样占掉一次候选名额（一次要 40 多秒）和 6 分钟
+// 黑名单。先量清楚比例再决定在哪一层挡掉。只在 FANOUT_LIVE_TEST=1 时跑。
+func TestLiveNodeConfigCoverage(t *testing.T) {
+	if os.Getenv("FANOUT_LIVE_TEST") != "1" {
+		t.Skip("设 FANOUT_LIVE_TEST=1 才打真站")
+	}
+	nodes, err := fetchNodes(nodeFetchTimeout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	none, noSession := 0, 0
+	for _, n := range nodes {
+		if n.Config == "" && n.RemoteConfig == nil {
+			none++
+		}
+		if n.Sessions == 0 {
+			noSession++
+		}
+	}
+	t.Logf("源站列表 %d 个节点：没带 .ovpn 的 %d 个，sessions=0 的 %d 个", len(nodes), none, noSession)
+	for _, n := range nodes {
+		if n.Config == "" && n.RemoteConfig == nil {
+			t.Logf("  没配置的节点: %s %s %s 速度 %v Mbps", n.HostName, n.IP, n.CountryCode, n.SpeedMbps)
+		}
 	}
 }

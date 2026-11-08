@@ -14,9 +14,11 @@ func mgrWith(nodes []Node, running ...string) *Manager {
 const t_tmpdir = "/tmp"
 
 var sample = []Node{
-	{HostName: "jp1", CountryCode: "JP", Country: "Japan", SpeedMbps: 300, Ping: 10, Residential: true},
-	{HostName: "jp2", CountryCode: "JP", Country: "Japan", SpeedMbps: 200, Ping: 20, Residential: true},
-	{HostName: "kr1", CountryCode: "KR", Country: "Korea", SpeedMbps: 150, Ping: 30, Residential: true},
+	// Config 要给：实测源站 CSV 里没有一个节点是不带 .ovpn 的，而 candidatesFor
+	// 会跳过“既没内联配置又没取数引用”的节点（那种永远连不上）。
+	{HostName: "jp1", CountryCode: "JP", Country: "Japan", SpeedMbps: 300, Ping: 10, Residential: true, Config: "client\nremote 1.2.3.1 443\n"},
+	{HostName: "jp2", CountryCode: "JP", Country: "Japan", SpeedMbps: 200, Ping: 20, Residential: true, Config: "client\nremote 1.2.3.2 443\n"},
+	{HostName: "kr1", CountryCode: "KR", Country: "Korea", SpeedMbps: 150, Ping: 30, Residential: true, Config: "client\nremote 1.2.3.3 443\n"},
 }
 
 func TestPickNodesSkipsRunning(t *testing.T) {

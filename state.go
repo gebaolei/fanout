@@ -17,6 +17,13 @@ type persistedTunnel struct {
 	CountryCode string `json:"country_code"`
 	Country     string `json:"country"`
 	Config      string `json:"config"`
+	// 第三方节点池的 .ovpn 引用。跑在池子节点上的隧道必须把它存下来：
+	// 列表只是一个 commit 的快照，重启后这个节点可能已经不在当前列表里，
+	// 而它的 .ovpn 又不像源站节点那样内联在列表里。不存的话恢复出来就是个
+	// 空 Config，谁也连不上（真机上撞到过：候选 xxx 连不上：没有 .ovpn 配置）。
+	ConfigCommit string `json:"config_commit,omitempty"`
+	ConfigPath   string `json:"config_path,omitempty"`
+	ConfigSHA256 string `json:"config_sha256,omitempty"`
 	// SOCKS5 凭据要存盘：用户已经把它分发给客户端了，重启后变掉等于全断
 	SocksUser string `json:"socks_user,omitempty"`
 	SocksPass string `json:"socks_pass,omitempty"`
@@ -51,6 +58,12 @@ func (m *Manager) saveState() error {
 			SocksPass:   t.Cred.Pass,
 			PrevHost:    t.prevHostOf(),
 		})
+		if ref := t.Node.RemoteConfig; ref != nil {
+			n := len(st.Tunnels) - 1
+			st.Tunnels[n].ConfigCommit = ref.Commit
+			st.Tunnels[n].ConfigPath = ref.Path
+			st.Tunnels[n].ConfigSHA256 = ref.SHA256
+		}
 	}
 
 	blob, err := json.MarshalIndent(st, "", "  ")
@@ -97,6 +110,11 @@ func (m *Manager) restoreState() (int, error) {
 			}
 		}
 		node.Config = p.Config
+		// 存盘时还没取到 .ovpn 的池子节点（重连只做了一半就被重启），照着存盘
+		// 的引用把取数入口接回来。不这么做的话这条隧道恢复出来就是个死候选。
+		if node.Config == "" && node.RemoteConfig == nil && p.ConfigPath != "" {
+			node.RemoteConfig = &configRef{Commit: p.ConfigCommit, Path: p.ConfigPath, SHA256: p.ConfigSHA256}
+		}
 		// 从旧版本升上来的状态文件没有凭据字段，补一套新的
 		cred := SocksCred{User: p.SocksUser, Pass: p.SocksPass}
 		if cred.User == "" || cred.Pass == "" {
@@ -114,6 +132,15 @@ func (m *Manager) restoreState() (int, error) {
 			Cred:   cred,
 		}
 		t.setPrevHost(p.PrevHost)
+		if t.Node.Config == "" && t.Node.RemoteConfig == nil {
+			// 存盘记录里既没有 .ovpn，也没有可取的引用：上一次重连只做到一半就
+			// 重启了，或者那个池子节点已经过期。这种节点永远连不上，却会占掉一个
+			// 候选名额（一次 40 多秒）外加 6 分钟黑名单，所以直接当“刚连不上”处理，
+			// 让同地区其他节点顶上来。
+			log.Printf("槽 %d 的落盘记录里没有 %s 的 .ovpn，先试同地区其他节点",
+				p.Slot, p.HostName)
+			t.markAutoFail(p.HostName)
+		}
 		m.mu.Lock()
 		m.tunnels[p.Slot] = t
 		m.mu.Unlock()

@@ -257,6 +257,9 @@ func TestCandidatesForPrefersLiveNodes(t *testing.T) {
 	nodes := []Node{
 		{HostName: "vpn900001", CountryCode: "JP", SpeedMbps: 900, Residential: true, RemoteConfig: ref("pool/configs/1.json")},
 		{HostName: "vpn900002", CountryCode: "JP", SpeedMbps: 800, Residential: true, RemoteConfig: ref("pool/configs/2.json")},
+		// 分数最高，但既没内联 .ovpn 又没取数引用：这种节点连不上，
+		// 不该占掉一个候选名额（试一个要 40 多秒）
+		{HostName: "vpnbroken", CountryCode: "JP", SpeedMbps: 9999, Residential: true},
 		{HostName: "jp1", CountryCode: "JP", SpeedMbps: 300, Residential: true, Config: "client\nremote 1.1.1.1 443\n"},
 		{HostName: "jp2", CountryCode: "JP", SpeedMbps: 200, Residential: true, Config: "client\nremote 1.1.1.2 443\n"},
 	}

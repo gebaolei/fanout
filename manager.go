@@ -535,6 +535,11 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 			if used[n.HostName] || avoid[n.HostName] {
 				continue
 			}
+			// 既没内联 .ovpn、又没有取数引用的节点永远连不上（状态文件里
+			// 只写了一半、或者上游字段缺了），不该让它占掉一轮里的一个名额
+			if n.Config == "" && n.RemoteConfig == nil {
+				continue
+			}
 			// 地区实在拿不到时不做限制，总比连不上强
 			if region != "" && n.CountryCode != region {
 				continue
