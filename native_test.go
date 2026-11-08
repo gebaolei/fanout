@@ -33,23 +33,56 @@ func TestBuildXrayConfigBindsOnlyLiveTunnels(t *testing.T) {
 
 	cfg := buildXrayConfig(inbounds, []*Tunnel{up, down})
 
-	outs := map[string]bool{}
-	for _, o := range cfg["outbounds"].([]any) {
-		outs[o.(map[string]any)["tag"].(string)] = true
+	outs := cfg["outbounds"].([]any)
+	// outbounds 第一位就是 Xray 的默认出站，必须是 block：
+	// 绑的隧道掉了时没规可匹配，默认若是 direct 就等于泄露母机 IP。
+	if got := outs[0].(map[string]any)["tag"]; got != "block" {
+		t.Errorf("默认出站（outbounds[0]）应为 block，实际 %v", got)
 	}
-	if !outs["fanout-jp1"] {
+	tags := map[string]bool{}
+	for _, o := range outs {
+		tags[o.(map[string]any)["tag"].(string)] = true
+	}
+	if !tags["fanout-jp1"] {
 		t.Error("已连通的隧道应当有对应出站")
 	}
-	if outs["fanout-jp2"] {
+	if tags["fanout-jp2"] {
 		t.Error("未连通的隧道不该生成出站")
 	}
 
 	rules := cfg["routing"].(map[string]any)["rules"].([]any)
-	if len(rules) != 1 {
-		t.Fatalf("只有绑到连通隧道的入站才该有规则，实际 %d 条", len(rules))
+	byTag := map[string]string{}
+	for _, r := range rules {
+		m := r.(map[string]any)
+		in := m["inboundTag"].([]any)[0].(string)
+		out, _ := m["outboundTag"].(string)
+		byTag[in] = out
 	}
-	if got := rules[0].(map[string]any)["outboundTag"]; got != "fanout-jp1" {
-		t.Errorf("outboundTag = %v, want fanout-jp1", got)
+	if got := byTag["in-100-tcp"]; got != "fanout-jp1" {
+		t.Errorf("连通出口的入站 = %q, want fanout-jp1", got)
+	}
+	// 用户显式选直连的入站要有自己的 direct 规则：
+	// 默认出站改成 block 后，少了这条规则它会断网。
+	if got := byTag["in-300-tcp"]; got != "direct" {
+		t.Errorf("未绑定（直连）的入站 = %q, want direct", got)
+	}
+	// 绑在掉线隧道上的入站既不能进 direct（泄露）也不能乱指
+	if out, ok := byTag["in-200-tcp"]; ok {
+		t.Errorf("绑在掉线隧道上的入站不该有规则，实际指向 %s", out)
+	}
+}
+
+// 默认出站必须是黑湖：入站找不到匹配规则时（绑的隧道正在重连）
+// 宁断不漏。
+func TestBuildXrayConfigDefaultsToBlock(t *testing.T) {
+	cfg := buildXrayConfig([]*nativeInbound{{ID: 1, Port: 100, Protocol: "vless", Enable: true, BoundTo: "jp1"}}, nil)
+	outs := cfg["outbounds"].([]any)
+	first := outs[0].(map[string]any)
+	if first["tag"] != "block" || first["protocol"] != "blackhole" {
+		t.Errorf("默认出站应为 block/blackhole，实际 %v/%v", first["tag"], first["protocol"])
+	}
+	if len(cfg["routing"].(map[string]any)["rules"].([]any)) != 0 {
+		t.Error("没有可用隧道时不该生成任何路由规则")
 	}
 }
 

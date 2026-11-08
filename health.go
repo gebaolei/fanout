@@ -2,8 +2,7 @@ package main
 
 import (
 	"log"
-	"os/exec"
-	"strconv"
+	"net"
 	"strings"
 	"time"
 )
@@ -12,6 +11,20 @@ const (
 	healthInterval = 10 * time.Second
 	healthFailures = 2 // 连续失败几次才判定掉线，避免网络抖动误杀
 	healthTimeout  = 6 * time.Second
+)
+
+var (
+	// 头一次探测失败后，给 openvpn 自愈留出的窗口：每 healStep 复查一次，
+	// 最多复查到 healWindow。
+	//
+	// 必须给：VPN Gate 下发的 ping-restart 很激进，openvpn 会因为几分钟的
+	// 拥塞自己重启，实测 3 秒左右恢复。以前不给这段时间，健康检查正好撞上
+	// 那几秒 → 判掉线 → 把刚恢复的隧道拆掉 → 又连回同一个节点，
+	// 实测每 4 分钟来一轮，每轮十几秒流量从母机泄露。
+	//
+	// 写成 var（不是 const）只是为了单测能把窗口缩到毫秒级。
+	healWindow = 12 * time.Second
+	healStep   = 3 * time.Second
 )
 
 // WatchHealth 周期检查每条隧道是否还能出网，掉线的自动换节点重连。
@@ -24,42 +37,113 @@ func (m *Manager) WatchHealth() {
 			if t.Status != "up" {
 				continue
 			}
-			if m.tunnelHealthy(t) {
+			v := m.checkTunnel(t)
+			switch v {
+			case healthOK:
 				fails[t.Slot] = 0
-				continue
-			}
 
-			fails[t.Slot]++
-			if fails[t.Slot] < healthFailures {
-				log.Printf("隧道 %d (%s) 探测失败 %d 次", t.Slot, t.Node.HostName, fails[t.Slot])
-				continue
-			}
+			case healthLeaked:
+				// 出口 IP 变回母机地址：流量正在从母机 NAT 出去。
+				// 这种不等自愈，立刻拆 —— 多等一秒就多泄露一秒。
+				log.Printf("隧道 %d (%s) 出口变回母机地址，立即换节点重连", t.Slot, t.Node.HostName)
+				fails[t.Slot] = 0
+				m.autoReconnect(t)
 
-			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, t.Node.HostName)
-			fails[t.Slot] = 0
-			m.reconnect(t, t.Node.HostName)
+			default:
+				fails[t.Slot]++
+				// 只在头一次失败时等自愈：真挂掉的节点仍然在两三个探测周期内
+				// 被换掉，而不是每次失败都白等 12 秒。
+				if fails[t.Slot] == 1 && m.waitForHeal(t) {
+					fails[t.Slot] = 0
+					continue
+				}
+				if fails[t.Slot] < healthFailures {
+					log.Printf("隧道 %d (%s) 探测失败 %d 次（%s）",
+						t.Slot, t.Node.HostName, fails[t.Slot], v)
+					continue
+				}
+				log.Printf("隧道 %d (%s) 已掉线（%s），正在换节点重连",
+					t.Slot, t.Node.HostName, v)
+				fails[t.Slot] = 0
+				m.autoReconnect(t)
+			}
 		}
 	}
 }
 
-// tunnelHealthy 判断隧道是否还真的走在 VPN 上。
+// autoReconnect 是健康检查触发的重连：先把当前节点记进短期黑名单。
 //
-// 只看"能不能出网"是不够的：netns 通过 veth 走母机 NAT，
-// openvpn 死掉后照样能出网，只是出口变回了母机 IP。
-// 所以要比对出口 IP 是否仍是建立隧道时拿到的那个。
-func (m *Manager) tunnelHealthy(t *Tunnel) bool {
-	out, err := cmdOutput(exec.Command("ip", "netns", "exec", t.nsName(),
-		"curl", "-s", "--max-time", strconv.Itoa(int(healthTimeout.Seconds())),
-		"http://api.ipify.org"))
-	if err != nil {
-		return false
+// 不加这一步，候选列表永远把原节点排第一位（那是"恢复原样"的语义），
+// 于是一条抖动的隧道会一直撞回刚才那个连不上的节点 —— 真机上看到的
+// 就是同一个 hostname 每隔几分钟重建一次。
+func (m *Manager) autoReconnect(t *Tunnel) {
+	t.markAutoFail(t.Node.HostName)
+	m.reconnect(t, t.Node.HostName)
+}
+
+// waitForHeal 在一次探测失败后再问几次，看隧道是不是自己回来了。
+// 回来就返回 true，调用方不该重连。
+func (m *Manager) waitForHeal(t *Tunnel) bool {
+	deadline := time.Now().Add(healWindow)
+	for time.Now().Add(healStep).Before(deadline) {
+		time.Sleep(healStep)
+		if m.checkTunnel(t) != healthOK {
+			continue
+		}
+		log.Printf("隧道 %d (%s) 探测失败后自行恢复，不重连", t.Slot, t.Node.HostName)
+		return true
 	}
-	got := strings.TrimSpace(string(out))
+	return false
+}
+
+// healthVerdict 是一次健康检查的结论。四种情况处理方式不同，
+// 所以不能只返回 bool —— 全当"掉线"处理会把自愈和泄露都误判。
+type healthVerdict int
+
+const (
+	healthOK      healthVerdict = iota // 还在原来的出口上
+	healthUnknown                      // 查询本身失败或返回空：不知道出口是谁
+	healthLeaked                       // 出口变成母机公网 IP：流量正在从母机泄露
+	healthChanged                      // 出口变成别的地址（隧道没了，或者节点换了 IP）
+)
+
+func (v healthVerdict) String() string {
+	switch v {
+	case healthOK:
+		return "正常"
+	case healthLeaked:
+		return "出口退回母机"
+	case healthChanged:
+		return "出口 IP 变了"
+	default:
+		return "查询失败"
+	}
+}
+
+// classifyExit 判断"探到的出口 IP"意味着什么。抽成纯函数是为了能单测：
+// 真正的探测要 root 和 netns，分类逻辑不需要。
+//
+//	got     探到的出口 IP（查询失败时为空）
+//	want    建立隧道时记下的出口 IP
+//	hostIP  母机公网地址，探不到时为空
+func classifyExit(got, want, hostIP string) healthVerdict {
+	got = strings.TrimSpace(got)
 	if got == "" {
-		return false
+		return healthUnknown
 	}
-	// 出口 IP 变了说明 VPN 已经断开，流量退回了母机
-	return got == t.ExitIP
+	if net.ParseIP(got) == nil {
+		// 返回的不是 IP（被门户页、拦截页吃掉），等同于查询没成功
+		return healthUnknown
+	}
+	if got == strings.TrimSpace(want) {
+		return healthOK
+	}
+	// 出口 IP 变了。分不清"退回母机"和"节点自己换了 IP"时都得重连，
+	// 但退回母机必须单独认出来：那种情况下流量正在暴露服务器真实地址。
+	if hostIP != "" && got == hostIP {
+		return healthLeaked
+	}
+	return healthChanged
 }
 
 // reconnect 就地把一条隧道换到别的节点上，保持槽位与端口不变，
@@ -115,4 +199,32 @@ func (m *Manager) reconnect(t *Tunnel, oldHost string) {
 			log.Printf("保存状态失败: %v", err)
 		}
 	}()
+}
+
+// healthProbe 是单测留的注入口：非 nil 时取代真实的 netns 查询。
+// 真机上始终是 t.queryExitIP；测试里换成普通函数，waitForHeal 才能跑通
+// "第一次探失败、紧接着自己好了"这条路径（不必有 root 和 netns）。
+var healthProbe func(*Tunnel, time.Duration) (string, error)
+
+// checkTunnel 走一次出口探测并给出结论。
+//
+// 只看"能不能出网"是不够的：netns 通过 veth 走母机 NAT，openvpn 挂掉后
+// 照样能出网，只是出口变回了母机 IP。所以要比对出口 IP 是否还是建隧道时那个。
+func (m *Manager) checkTunnel(t *Tunnel) healthVerdict {
+	var (
+		got string
+		err error
+	)
+	if healthProbe != nil {
+		got, err = healthProbe(t, healthTimeout)
+	} else {
+		got, err = t.queryExitIP(healthTimeout)
+	}
+	if err != nil {
+		return healthUnknown
+	}
+	// 这里是全程序唯一主动刷新母机公网地址的地方（30 分钟 TTL）。
+	// 母机重启换了 IP 而缓存还是旧值的话，泄露会被误判成"出口 IP 变了"，
+	// 反而看不出问题。
+	return classifyExit(got, t.ExitIP, hostPublicIP())
 }

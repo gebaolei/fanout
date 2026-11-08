@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,11 @@ type Tunnel struct {
 	// 手动换节点要避开它们：只排除"当前这个"的话，连点两次就会在
 	// 两个节点之间来回跳（A 换成 B，B 再换回 A）。
 	swapped []string
+	// autoFails 记下自动重连里刚连不上的节点与时间，短期内不再把它当首选。
+	// 与 swapped 分开：那是用户明确不要的 IP，要一直避开；这里只是
+	// "刚才那个连不上，过一阵再说"（见 autoFailTTL）。
+	// 只存在内存里，与 swapped 一致：重启后应该重新开始试原来的节点。
+	autoFails map[string]time.Time
 	// prevHost 是"换节点动作还没收尾"的标记：记着换之前绑的是谁。
 	//
 	// 换节点分两步——先把隧道连到新节点，再把入站从旧节点改绑过来。
@@ -107,6 +113,48 @@ func (t *Tunnel) forgetSwaps() {
 	t.mu.Lock()
 	t.swapped = nil
 	t.mu.Unlock()
+}
+
+// autoFailTTL 是自动重连黑名单的有效期。
+//
+// 为什么不跟 swapped 共用一套：手动换过的节点是用户明确不要的出口 IP，
+// 得一直避开；自动重连失败的节点多半只是当时连不上（VPN Gate 家宽节点
+// 开机上线、关机下线很常见），永久拉黑会让候选池只缩不涨，
+// 最后反而把同地区抽干。30 分钟足够多轮退避重连（上限 5 分钟一次），
+// 又不至于把真挂了的节点立刻放回首选。
+const autoFailTTL = 30 * time.Minute
+
+// markAutoFail 把一个刚试过的节点放进短期黑名单。
+func (t *Tunnel) markAutoFail(host string) {
+	if host == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.autoFails == nil {
+		t.autoFails = map[string]time.Time{}
+	}
+	now := time.Now()
+	// 顺手清掉过期的：这张表只会因为重连失败变长，不清就只涨不消
+	for h, at := range t.autoFails {
+		if now.Sub(at) >= autoFailTTL {
+			delete(t.autoFails, h)
+		}
+	}
+	t.autoFails[host] = now
+}
+
+// autoAvoid 返回还在黑名单里的 hostname。
+func (t *Tunnel) autoAvoid(now time.Time) map[string]bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]bool, len(t.autoFails))
+	for h, at := range t.autoFails {
+		if now.Sub(at) < autoFailTTL {
+			out[h] = true
+		}
+	}
+	return out
 }
 
 // 名字里都带上实例标识，否则同机第二个 fanout 会把这条隧道拆掉（见 instance.go）。
@@ -221,6 +269,36 @@ func (t *Tunnel) teardownNetns() {
 	runQuiet("iptables", "-w", "5", "-D", "FORWARD", "-d", cidr, "-j", "ACCEPT")
 }
 
+// ovpnKeepalive 返回用来顶替上游下发值的保活参数。
+//
+// 默认 15/120：120 秒无人应答才重启链路。VPN Gate 推的是 3/10，对志愿者
+// 家宽来说太激进（晚上稍微拥塞就拆链路），而 fanout 自己每 10 秒探一次、
+// 连败两次就重连，不需要 openvpn 这么快地自己动手。
+//
+// FANOUT_OVPN_KEEPALIVE 可以调："10/60" 这种形式改两个值，"off" 则完全不加
+// --pull-filter（完全沿用上游推的值，即改动前的行为）。
+func ovpnKeepalive() (ping, restart int, ok bool) {
+	ping, restart = 15, 120
+	v, ok := os.LookupEnv("FANOUT_OVPN_KEEPALIVE")
+	if !ok {
+		return ping, restart, true
+	}
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "off" || v == "none" || v == "" {
+		return 0, 0, false
+	}
+	a, b, found := strings.Cut(v, "/")
+	if !found {
+		return ping, restart, true
+	}
+	p, err1 := strconv.Atoi(strings.TrimSpace(a))
+	r, err2 := strconv.Atoi(strings.TrimSpace(b))
+	if err1 != nil || err2 != nil || p < 1 || r < p {
+		return ping, restart, true
+	}
+	return p, r, true
+}
+
 // startOpenVPN 在 netns 内拉起 openvpn，并等待 tun0 拿到地址。
 func (t *Tunnel) startOpenVPN(dir string) error {
 	ns := t.nsName()
@@ -245,6 +323,20 @@ func (t *Tunnel) startOpenVPN(dir string) error {
 		"--verb", "3",
 		"--log", logPath,
 	)
+	// VPN Gate 会下发激进的保活参数（实测 PUSH_REPLY 里是 ping 3、ping-restart 10）：
+	// 家宽节点稍有拥塞就触发 --ping-restart，openvpn 自我重启几秒后又连上。
+	// 那几秒钟里 tun0 与 /1 路由都不在，流量从母机 NAT 出去（泄露），
+	// 而 fanout 的健康检查正好把这段当成掉线，把刚恢复的隧道拆掉重连。
+	// 这里把下发的保活拦掉、用自己的值：判活交给 fanout（10 秒一轮、连败两次），
+	// openvpn 只负责长时间无人应答才重启，不再因为几分钟的拥塞反复拆链路。
+	if ping, restart, ok := ovpnKeepalive(); ok {
+		cmd.Args = append(cmd.Args,
+			"--pull-filter", "ignore", "ping",
+			"--pull-filter", "ignore", "ping-restart",
+			"--ping", strconv.Itoa(ping),
+			"--ping-restart", strconv.Itoa(restart),
+		)
+	}
 	if err := cmdStart(cmd); err != nil {
 		return fmt.Errorf("启动 openvpn 失败: %w", err)
 	}
@@ -326,16 +418,32 @@ func (t *Tunnel) setCredential(c SocksCred) {
 	t.Cred = c
 }
 
-// probeExitIP 通过隧道查询出口 IP，用于确认这条隧道确实换了 IP。
-func (t *Tunnel) probeExitIP() (string, error) {
+// queryExitIP 在 netns 内查一次出口 IP，只做查询与格式校验，不做判断。
+// 健康检查要用它拿到"退回母机"这个值本身，所以不能预先把它滤掉。
+func (t *Tunnel) queryExitIP(timeout time.Duration) (string, error) {
 	out, err := cmdOutput(exec.Command("ip", "netns", "exec", t.nsName(),
-		"curl", "-s", "--max-time", "15", "http://api.ipify.org"))
+		"curl", "-s", "--max-time", strconv.Itoa(max(int(timeout.Seconds()), 1)), "http://api.ipify.org"))
 	if err != nil {
 		return "", fmt.Errorf("查询出口 IP 失败: %w", err)
 	}
 	ip := strings.TrimSpace(string(out))
 	if net.ParseIP(ip) == nil {
 		return "", fmt.Errorf("出口 IP 返回异常: %q", ip)
+	}
+	return ip, nil
+}
+
+// probeExitIP 通过隧道查询出口 IP，用于确认这条隧道确实换了 IP。
+func (t *Tunnel) probeExitIP() (string, error) {
+	ip, err := t.queryExitIP(15 * time.Second)
+	if err != nil {
+		return "", err
+	}
+	// openvpn 起来了不等于流量真走隧道：tun0 拿到了地址、但 /1 路由没装上
+	// 或被下发的路由抢掉时，查询照样成功，只是出口变成母机 NAT。以前这种
+	// 隧道会被标成 up，用户拿到的是机房 IP 却以为是住宅 IP。
+	if host := hostPublicIPCached(); host != "" && ip == host {
+		return "", fmt.Errorf("出口 IP 是母机公网地址 %s，隧道没有真正接管流量", host)
 	}
 	return ip, nil
 }

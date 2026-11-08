@@ -362,6 +362,9 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 			}
 			return true
 		}
+		// 短期内别再把它当首选：候选轮完一圈又撞回同一个连不上的节点，
+		// 就变成真机上那种“同一个 hostname 每几分钟重建一次”。
+		t.markAutoFail(node.HostName)
 		t.teardownNetns()
 	}
 	return false
@@ -403,13 +406,21 @@ func (m *Manager) tryNode(t *Tunnel) error {
 
 // candidatesFor 以这条隧道当前的节点打头，后面跟上同地区的其他节点作为备选。
 //
-// 打头的一定是 t.Node：自动重连的目标是把这条出口恢复原样，先试原节点。
+// 打头的一般是 t.Node：自动重连的目标是把这条出口恢复原样，先试原节点。
+// 例外是它刚在自动重连里连不上过 —— 那时还把它排第一，就会形成
+// “拆掉 → 又连回同一个 → 再拆”的循环（真机上同一个 hostname 每几分钟重建一次）。
+// 黑名单只改优先级：同地区抽不出别人时照样回到它，不会把隧道饿死。
 // 备选会避开用户手动换掉过的节点——那些是他明确不想要的 IP，
 // 让重连悄悄换回去等于撤销了他的操作。
 func (m *Manager) candidatesFor(t *Tunnel) []Node {
 	const maxTries = 6
 	first := t.Node
 	avoid := t.swapAvoid()
+	// 除了用户手动换掉过的，还要避开短期内连不上过的节点
+	blacklist := t.autoAvoid(time.Now())
+	for h := range blacklist {
+		avoid[h] = true
+	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -431,7 +442,11 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 		}
 	}
 
-	out := []Node{first}
+	// 刚连不上的原节点不再排第一，同地区有别人就先试别人
+	out := []Node{}
+	if !blacklist[first.HostName] {
+		out = append(out, first)
+	}
 	for _, n := range m.nodePoolLocked() {
 		if len(out) >= maxTries {
 			break
@@ -444,6 +459,12 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 			continue
 		}
 		out = append(out, n)
+	}
+	if len(out) == 0 {
+		// 同地区没别人了（或者全被黑名单挡掉）。这时候还是得试原节点，
+		// 否则一条只剩一个候选的隧道会永远空转。
+		log.Printf("出口 %d 在 %s 没有其它候选节点，还是先试 %s", t.Slot, region, first.HostName)
+		out = append(out, first)
 	}
 	return out
 }

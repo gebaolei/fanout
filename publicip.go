@@ -64,6 +64,23 @@ func hostPublicIP() string {
 	return ip
 }
 
+// hostPublicIPCached 只拿已有的结果（显式覆盖值或未过期缓存），不发请求。
+//
+// 拉起隧道的路径上用这个：那里多等 5 秒就是每次连接都可能被拖慢，
+// 而探不到母机 IP 时顶多是少一道保险，不会误判。
+// 缓存靠健康检查里的 hostPublicIP() 保持新鲜（30 分钟 TTL）。
+func hostPublicIPCached() string {
+	publicIPMu.Lock()
+	defer publicIPMu.Unlock()
+	if publicIPOverride != "" {
+		return publicIPOverride
+	}
+	if publicIPCache != "" && time.Since(publicIPAt) < publicIPTTL {
+		return publicIPCache
+	}
+	return ""
+}
+
 // probePublicIP 逐个问外部接口，拿到第一个合法的 IPv4 就返回。
 func probePublicIP() string {
 	for _, url := range publicIPSources {

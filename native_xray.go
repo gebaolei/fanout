@@ -57,7 +57,8 @@ func findXray(workDir string) (string, error) {
 // buildXrayConfig 由入站列表和当前隧道生成完整的 Xray 运行配置。
 //
 // 出站分三类：每条连通隧道一个 socks 出站（tag 为 fanout-<节点名>）、
-// 一个直连 direct、一个 block。绑定关系落成 routing 规则。
+// 一个直连 direct、一个 block。绑定关系落成 routing 规则；
+// 默认出站是 block，所以“绑的隧道掉了”会断网而不是退回直连。
 func buildXrayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map[string]any {
 	live := map[string]bool{}
 	for _, t := range tunnels {
@@ -74,15 +75,25 @@ func buildXrayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map[string]an
 		ins = append(ins, nativeInboundJSON(ib))
 	}
 
-	// direct 强制 IPv4：隧道内没有 IPv6，母机有全局 IPv6 时
-	// 没匹配上规则的流量会从 IPv6 出去，暴露服务器真实地址。
+	// 默认出站取 block（outbounds 第一位就是 Xray 的默认出站）。
+	//
+	// 绑到隧道的入站靠 routing 规则走；隧道不是 up 时那条规则不会出现，
+	// 流量就落默认出站。以前默认是 direct，于是“隧道正在重连”的十几秒里
+	// 流量从母机 NAT 直接出去 —— 客户端看起来只是“慢了一下”，
+	// 但服务器真实地址已经漏出去了（实测掉线重连窗口里就是这样）。
+	// 现在宁断不漏：默认进黑湖，重连完成后再恢复。
+	//
+	// 用户主动选“直连”的入站（BoundTo 为空）有自己那条显式规则，
+	// 依旧走 direct，不受这次改动影响。
 	outs := []any{
+		map[string]any{"tag": "block", "protocol": "blackhole"},
 		map[string]any{
+			// direct 强制 IPv4：隧道内没有 IPv6，母机有全局 IPv6 时
+			// 没匹配上规则的流量会从 IPv6 出去，暴露服务器真实地址。
 			"tag":      "direct",
 			"protocol": "freedom",
 			"settings": map[string]any{"domainStrategy": "UseIPv4"},
 		},
-		map[string]any{"tag": "block", "protocol": "blackhole"},
 	}
 	for _, t := range tunnels {
 		if t.Status != "up" {
@@ -99,13 +110,26 @@ func buildXrayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map[string]an
 
 	rules := []any{}
 	for _, ib := range inbounds {
-		if !ib.Enable || ib.BoundTo == "" || !live[ib.BoundTo] {
+		if !ib.Enable {
+			continue
+		}
+		tag := ""
+		switch {
+		case ib.BoundTo == "":
+			// 用户显式选了“直连”，继续给 direct（不能归到默认出站，
+			// 默认已经是 block 了）
+			tag = "direct"
+		case live[ib.BoundTo]:
+			tag = xuiTagPrefix + ib.BoundTo
+		default:
+			// 绑的隧道没起来：不给规则，落默认出站（block）。
+			// 这一行就是 fail-open 与 fail-closed 的分界点。
 			continue
 		}
 		rules = append(rules, map[string]any{
 			"type":        "field",
 			"inboundTag":  []any{ib.tag()},
-			"outboundTag": xuiTagPrefix + ib.BoundTo,
+			"outboundTag": tag,
 		})
 	}
 
