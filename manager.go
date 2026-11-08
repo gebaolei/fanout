@@ -410,6 +410,11 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 			}
 			return true
 		}
+		// 一个连不上的候选要耗 40 多秒（等 tun0 就绪的窗口），一轮六七个
+		// 就是四五分钟。不打这一行的话，整段时间日志上是空的，界面上只
+		// 剩一句“已换到第 N 个候选节点”，完全看不出在等谁、为什么没连上
+		// （真机上排查出口停了 25 分钟就是被这里碍住的）。
+		log.Printf("出口 %d 候选 %s（%s）连不上: %v", t.Slot, node.HostName, node.IP, err)
 		// 短期内别再把它当首选：候选轮完一圈又撞回同一个连不上的节点，
 		// 就变成真机上那种“同一个 hostname 每几分钟重建一次”。
 		t.markAutoFail(node.HostName)
@@ -512,18 +517,30 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 	if !blacklist[first.HostName] {
 		out = append(out, first)
 	}
-	for _, n := range m.nodePoolLocked() {
-		if len(out) >= maxTries {
-			break
+	// 先取源站列表里的节点（.ovpn 内联，说明这一轮源站还说它在），
+	// 抽不满才用第三方池的（7 天快照 + 别人从 Cloudflare 边缘做的 TCP 探测）。
+	// 自动重连要的是“能连回来”，不是“分数高”：节点合并时按速度排序，
+	// 池子里的历史高分节点会插到实时节点前面，而它们只保证“六小时前某个
+	// 国外边缘 TCP 端口能连上”。候选面变大是新开出口和手动换节点的好处，
+	// 不该在自动恢复时抢在实时节点前面。
+	for pass := range 2 {
+		for _, n := range m.nodePoolLocked() {
+			if len(out) >= maxTries {
+				break
+			}
+			// 第一轮只收带内联配置的，第二轮才放池子里的进来
+			if (n.Config == "" && n.RemoteConfig != nil) == (pass == 0) {
+				continue
+			}
+			if used[n.HostName] || avoid[n.HostName] {
+				continue
+			}
+			// 地区实在拿不到时不做限制，总比连不上强
+			if region != "" && n.CountryCode != region {
+				continue
+			}
+			out = append(out, n)
 		}
-		if used[n.HostName] || avoid[n.HostName] {
-			continue
-		}
-		// 地区实在拿不到时不做限制，总比连不上强
-		if region != "" && n.CountryCode != region {
-			continue
-		}
-		out = append(out, n)
 	}
 	if len(out) == 0 {
 		// 同地区没别人了（或者全被黑名单挡掉）。这时候还是得试原节点，
