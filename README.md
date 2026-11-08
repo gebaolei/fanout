@@ -140,12 +140,37 @@ VPN Gate 的接口一次只给一百来个节点，而且是按它自己算的�
 
 「新建出口」里能看到上次拉取时间与各源成败，也可以直接点「刷新节点列表」。
 
+#### 第三方滚动节点池
+
+上面三个源拿的都是源站那份“按分数取头部”的 ~100 个。还有人把 VPN Gate 的清单
+做成了一个 7 天滚动的池子（GitHub 仓库，jsDelivr / GitHub Raw 分发），并且自己
+养了两个 Cloudflare Worker 做 TCP 探测。fanout 把它当第 4 个源，只收“探测
+6 小时内可达”的那批：
+
+- 实测（同一台机器上背靠背各跑一次）：合并后节点 281 → 973，家宽覆盖 14 → 28 个国家。
+  选面大得多，“换一个节点”不会翻来覆去就那几个 IP
+- 不会被 VPN Gate 限流：只是从 CDN 读一份 30 分钟一轮的静态副本，
+  不吃源站配额（主站被限流时它还能顶上）
+- 每个节点的 .ovpn 按 sha256 分文件存，只有真要连那个节点时才去取（13KB 一个）。
+  列表里这几百个节点不占内存，也不会提前下载
+- 探测只到 TCP 端口层面，而且是从 Cloudflare 边缘探的 —— 不代表从这台机器连得上，
+  所以这些节点照样要过 fanout 自己的握手、出口 IP 校验和健康检查
+- 取数按上游规定的姿势：先读 1KB 的索引，固定 data_commit，再按字节数与 sha256
+  校验正文；commit 没变就不重拉那 7.1MB。过滤后的列表存 `<workDir>/pool.json`，
+  重启先读盘
+- 不要求节点此刻还在源站 CSV 里（候选增量就在这里），但同名节点以 CSV 的实时
+  分数/延迟为准。实测两边的 IP 会不一致（家宽 IP 会变），这时候用 CSV 的
+
 环境变量（不设就用默认值）：
 
 ```
 FANOUT_VPNGATE_SITES     列表页地址。默认官方的 /en/sites.aspx；设成空串就是不用镜像
 FANOUT_VPNGATE_SOURCES   每轮取几个镜像，默认 2；设 0 就是只用主站（即旧行为）
 FANOUT_VPNGATE_TIMEOUT   单个源的超时，默认 25s；带宽差的机器上 1.3 MB 可能要 60s
+FANOUT_VPNGATE_POOL      第三方节点池的索引地址；设成空串就是不用这个源
+FANOUT_VPNGATE_POOL_TIMEOUT 拉池文件的超时，默认 60s（那份文件 7.1MB）
+FANOUT_VPNGATE_POOL_CDN  池文件的 CDN 地址（自建镜像、国内加速时改）
+FANOUT_VPNGATE_POOL_RAW  池文件的 GitHub Raw 地址（CDN 挂了的兜底）
 FANOUT_OVPN_KEEPALIVE    openvpn 保活。默认 15/120，并且会拦掉 VPN Gate 下发的
                          ping / ping-restart（它推的是 3/10，家宽节点稍有拥塞就拆链路，
                          拆的十几秒里流量从母机出去）。设 off 则完全沿用上游值；
@@ -156,6 +181,13 @@ FANOUT_OVPN_KEEPALIVE    openvpn 保活。默认 15/120，并且会拦掉 VPN Ga
 
 ```
 FANOUT_LIVE_TEST=1 FANOUT_LIVE_TIMEOUT=90s go test -run TestLiveMirrorProbe -v
+```
+
+想看多源聚合（含第三方节点池）在这台机器上到底拿回多少节点，跑这个；
+前面加 `FANOUT_VPNGATE_POOL=` 就是关掉第三方池作对比：
+
+```
+FANOUT_LIVE_TEST=1 FANOUT_VPNGATE_TIMEOUT=60s go test -run TestLiveRefreshNodes -v
 ```
 
 ### 节点链接从哪来

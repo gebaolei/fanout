@@ -25,9 +25,12 @@ type Manager struct {
 	// 判断的基准（按 URL 各自比；合并后的总数比单源大得多，不能混用）。
 	sourceCounts map[string]int
 	mirrors      *mirrorStore
-	workDir      string
-	maxSlots     int
-	jobs         JobStore
+	// pool 是第三方滚动节点池（见 poolsource.go）。与 mirrors 一样是可选源：
+	// 它挂了不影响这一轮，主站被限流时它能顶上。
+	pool     *poolStore
+	workDir  string
+	maxSlots int
+	jobs     JobStore
 }
 
 func NewManager(maxSlots int, workDir string) *Manager {
@@ -36,6 +39,7 @@ func NewManager(maxSlots int, workDir string) *Manager {
 		workDir:      workDir,
 		maxSlots:     maxSlots,
 		mirrors:      newMirrorStore(workDir),
+		pool:         newPoolStore(workDir),
 		sourceCounts: map[string]int{},
 	}
 }
@@ -70,7 +74,29 @@ func (m *Manager) RefreshNodes() (int, error) {
 	if m.mirrors != nil {
 		sources = m.mirrors.sources(time.Now(), timeout)
 	}
+	// 第三方节点池与 CSV 源并发拉：它最坏要 60 秒（7.1MB），串在前面会把
+	// 整轮刷新拖慢一倍。两边失败互不影响。
+	type poolResult struct {
+		nodes []Node
+		stat  sourceStat
+		err   error
+	}
+	poolDone := make(chan poolResult, 1)
+	go func() {
+		if m.pool == nil {
+			poolDone <- poolResult{}
+			return
+		}
+		nodes, stat, err := m.pool.get(time.Now(), poolFetchTimeout())
+		poolDone <- poolResult{nodes: nodes, stat: stat, err: err}
+	}()
+
 	nodes, stats, err := fetchAggregated(sources, timeout, prevByURL)
+	pr := <-poolDone
+	if pr.stat.URL != "" {
+		// 池源也进同一份统计：界面与日志不用为它特判一个字段
+		stats = append(stats, pr.stat)
+	}
 	if err != nil {
 		// 失败也要把各源结果存下来：界面要能看出是“三个源都拉不动”还是“只有主站挂了”
 		m.mu.Lock()
@@ -83,7 +109,20 @@ func (m *Manager) RefreshNodes() (int, error) {
 		for _, s := range stats {
 			log.Printf("  源 %s: %s", s.URL, s.Err)
 		}
-		return 0, err
+		if len(pr.nodes) == 0 {
+			return 0, err
+		}
+		// CSV 源全部失败（主站限流时真会这样），但第三方池里有货：
+		// 用它顶上。节点会旧半小时以上，总比告诉用户“没节点”强。
+		log.Printf("CSV 节点源全部失败，本轮改用第三方节点池的 %d 个节点", len(pr.nodes))
+	}
+	if len(pr.nodes) > 0 {
+		// CSV 排在前面：它是实时的，池子是缓存快照。mergeNodeSources 按
+		// hostname 去重时保留先出现的那条，所以同名节点沿用 CSV 的 Ping/Speed。
+		nodes = mergeNodeSources([][]Node{nodes, pr.nodes})
+	}
+	if len(nodes) == 0 {
+		return 0, fmt.Errorf("所有节点源都失败")
 	}
 	ok := 0
 	counts := make(map[string]int, len(stats))
@@ -101,8 +140,9 @@ func (m *Manager) RefreshNodes() (int, error) {
 	m.sourceCounts = counts
 	m.mu.Unlock()
 	mirrors, _ := m.MirrorSummary()
-	log.Printf("节点列表刷新完成：源 %d/%d 成功，合并后 %d 个节点（上一轮 %d），镜像列表缓存 %d 个",
-		ok, len(stats), len(nodes), prev, mirrors)
+	poolN, _ := m.PoolSummary()
+	log.Printf("节点列表刷新完成：源 %d/%d 成功，合并后 %d 个节点（上一轮 %d），镜像列表缓存 %d 个，第三方池 %d 个",
+		ok, len(stats), len(nodes), prev, mirrors, poolN)
 	// 部分成功时也要把挂掉的源和原因打出来。“源 1/3”不告诉你剩下两个是
 	// “镜像站本身挂了”还是“这台机器到不了非 80/443 的明文端口”，
 	// 而这两种情况的处理办法完全不同。
@@ -197,6 +237,14 @@ func (m *Manager) MirrorSummary() (int, time.Time) {
 		return 0, time.Time{}
 	}
 	return m.mirrors.summary()
+}
+
+// PoolSummary 返回第三方节点池里可用节点数，以及上游最后一次抓源站的时间。
+func (m *Manager) PoolSummary() (int, time.Time) {
+	if m.pool == nil {
+		return 0, time.Time{}
+	}
+	return m.pool.summary()
 }
 
 func (m *Manager) Nodes() ([]Node, time.Time) {
@@ -385,6 +433,23 @@ func (m *Manager) tunnelActive(t *Tunnel) bool {
 
 // tryNode 尝试用当前节点把隧道拉起来。
 func (m *Manager) tryNode(t *Tunnel) error {
+	// 第三方池的节点不在列表里内联 .ovpn，到这一步才去取（13KB）。
+	// 放在这里而不是拉列表时取：一轮拉 600 多个节点就是 8MB，
+	// 而实际只会连上其中一两个。
+	if t.Node.Config == "" && t.Node.RemoteConfig != nil {
+		if m.pool == nil {
+			return fmt.Errorf("节点 %s 的配置要去第三方节点池取，但这个源已被关闭", t.Node.HostName)
+		}
+		cfg, err := m.pool.config(t.Node, poolFetchTimeout())
+		if err != nil {
+			return err
+		}
+		t.Node.Config = cfg
+	}
+	if t.Node.Config == "" {
+		// 以前这种会写一个空配置文件给 openvpn，它报到超时也说不清原因
+		return fmt.Errorf("节点 %s 没有 .ovpn 配置", t.Node.HostName)
+	}
 	if err := t.setupNetns(); err != nil {
 		return err
 	}

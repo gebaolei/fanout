@@ -51,8 +51,22 @@ type Node struct {
 	SpeedMbps   float64 `json:"speed_mbps"`
 	Sessions    int     `json:"sessions"`
 	Config      string  `json:"-"` // 解码后的 .ovpn 内容
+	// RemoteConfig 非空表示 .ovpn 不在这份列表里，要按这个引用去取。
+	// 第三方滚动池是每个节点一个文件（按 sha256 分），全部内联就是 50MB，
+	// 而实际只有真要连的那个节点才用得上，所以懒加载。
+	RemoteConfig *configRef `json:"-"`
 	// Residential 表示这是志愿者的家庭宽带，不是 VPN Gate 自己的机房服务器。
 	Residential bool `json:"residential"`
+}
+
+// configRef 是一份 .ovpn 在第三方节点池里的位置。
+//
+// Commit 必须存下来：列表是 commit A 的、config 去拿 commit B 的话，
+// 路径里的 sha256 可能对不上，也可能拿到另一个节点的配置。
+type configRef struct {
+	Commit string
+	Path   string
+	SHA256 string
 }
 
 // vpngate 自营服务器所在的网段。这些是学术网络里的机房机器，

@@ -199,6 +199,7 @@ func apiNodes(m *Manager) http.HandlerFunc {
 		nodes, fetched := m.Nodes()
 		total := len(nodes)
 		mirrors, mirrorFetched := m.MirrorSummary()
+		poolN, poolFetched := m.PoolSummary()
 		// 默认跟挑节点的口径一致：开了"只用家宽"就不列机房节点。
 		// 带 all=1 能看到完整列表，用来确认过滤掉了多少。
 		if residentialOnly() && r.URL.Query().Get("all") != "1" {
@@ -224,6 +225,10 @@ func apiNodes(m *Manager) http.HandlerFunc {
 			"sources":        m.NodeSources(),
 			"mirror_count":   mirrors,
 			"mirror_fetched": mirrorFetched,
+			// 第三方滚动池（候选从 ~100 扩到 ~600 那个源）。它是 30 分钟一轮的
+			// 静态副本，所以单独标一份上游时间，不跟 fetched 混在一起
+			"pool_count":   poolN,
+			"pool_fetched": poolFetched,
 		})
 	}
 }
@@ -314,12 +319,15 @@ func apiRegions(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		_, fetched := m.Nodes()
 		mirrors, mirrorFetched := m.MirrorSummary()
+		poolN, poolFetched := m.PoolSummary()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"regions":        m.Regions(),
 			"fetched":        fetched,
 			"sources":        m.NodeSources(),
 			"mirror_count":   mirrors,
 			"mirror_fetched": mirrorFetched,
+			"pool_count":     poolN,
+			"pool_fetched":   poolFetched,
 		})
 	}
 }

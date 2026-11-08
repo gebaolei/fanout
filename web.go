@@ -899,6 +899,9 @@ function showFetched(r){
   const bits = ['节点列表 ' + new Date(iso).toLocaleString()];
   if(src.length) bits.push('源 ' + src.filter(s => !s.err).length + '/' + src.length);
   if(r.mirror_count) bits.push('镜像 ' + r.mirror_count + ' 个');
+  // 第三方滚动池的可用节点数。单独标是因为它是 30 分钟一轮的副本，
+  // 新鲜度不能跟上面那个“节点列表”时间混为一谈
+  if(r.pool_count) bits.push('池 ' + r.pool_count + ' 个');
   el.textContent = bits.join(' · ');
 }
 

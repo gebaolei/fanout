@@ -20,12 +20,17 @@ func useMainFeed(t *testing.T, url string) {
 	t.Cleanup(func() { vpngateAPI = old })
 }
 
-// noMirrors 关掉多源选源。这些测试不想去碰真镜像的地址 ——
-// 选源与去重的行为在 mirrors_test.go 里覆盖，合并行为在 vpngate_test.go 里。
+// noMirrors 关掉两个额外源：官方镜像与第三方节点池。
+//
+// 这些测试只关心 CSV 多源聚合本身。不关池源的话，它会真去打 GitHub
+// （慢、而且把“全部源失败”的用例变成“有货”），选源与去重的行为在
+// mirrors_test.go 里覆盖，合并行为在 vpngate_test.go 里，池源自己在
+// poolsource_test.go 里覆盖。
 func noMirrors(t *testing.T) {
 	t.Helper()
 	t.Setenv("FANOUT_VPNGATE_SOURCES", "0")
 	t.Setenv("FANOUT_VPNGATE_MIRROR", "")
+	t.Setenv("FANOUT_VPNGATE_POOL", "")
 }
 
 // 全部源失败时必须保留上一轮列表。这个语义改动前就有，多源后不能丢。
