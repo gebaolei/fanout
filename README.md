@@ -163,15 +163,27 @@ fanout 拉两个源，按 hostname 去重合并：
 FANOUT_AGG_API      https://你的agg/vpngate/api/iphone/
 FANOUT_AGG_TOKEN    Bearer token。走请求头，不拼进 URL —— 源地址会进日志与界面
 FANOUT_AGG_FILTER   附加筛选，默认 level=stable,reachable。也可以写
-                    residential=1、country=JP、min_purity=70、level=down 之类
+                    residential=1、country=JP、min_purity=70 之类
 FANOUT_AGG_TIMEOUT  单页超时，默认 30s
 FANOUT_AGG_MAX      这一轮最多收多少个，默认 1500
 ```
 
+`level` 这一项值得自己调一下，因为它直接决定候选面。拿一个 1500 个节点的池子实测：
+
+```
+stable 565 + reachable 75 + down 137 + unknown 618
+level=stable,reachable        →  640 个，22 个国家，US 10
+level=stable,reachable,unknown → 1243 个，44 个国家，US 26
+```
+
+`unknown` 是“没探成功过、但也没连续两轮明确否定”的。收进来候选面大一倍、小国家
+从 22 个涨到 44 个；代价是这些节点的可连性完全没验证过，而试一个连不上的节点
+要 40 多秒。默认不收，想收就改 `FANOUT_AGG_FILTER`，不用改代码。
+
 服务端侧要 `api.enabled=true` 配一个 token（≥16 字符），走公网务必套 HTTPS；
 翻页、筛选、限流都是它现成的能力，fanout 不改它一行代码。
-注意每个节点的 `.ovpn` 是内联在每一行里的，一千多个节点大约 17MB 常驻内存；
-嫌大就调小 `FANOUT_AGG_MAX` 或者加几个筛选项。
+注意每个节点的 `.ovpn` 是内联在每一行里的（实测平均 9.8KB）：640 个节点正文
+合计 6.4MB，1243 个约 12MB 常驻。嫌大就调小 `FANOUT_AGG_MAX` 或者收窄筛选。
 
 其它环境变量（不设就用默认值）：
 
