@@ -81,7 +81,7 @@ func main() {
 
 	mgr := NewManager(*maxSlots, *workDir)
 	// 启动先只拉主站：节点池在一个单源超时内就位，而隧道恢复不被多源拉取拖住。
-	// 镜像在后台补（见下面的 WarmNodePool）。
+	// 聚合中心在后台补（见下面的 WarmNodePool）。
 	log.Printf("正在拉取节点列表...")
 	if n, err := mgr.RefreshMainNodes(); err != nil {
 		log.Printf("拉取失败（可在 Web 界面重试）: %v", err)
@@ -98,7 +98,7 @@ func main() {
 		go mgr.ReconcileOutbounds()
 	}
 
-	// 恢复已经起步，这之后才把镜像源补上
+	// 恢复已经起步，这之后才把聚合中心那一大池候选补上
 	go mgr.WarmNodePool()
 
 	go mgr.WatchHealth()
@@ -198,8 +198,6 @@ func apiNodes(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		nodes, fetched := m.Nodes()
 		total := len(nodes)
-		mirrors, mirrorFetched := m.MirrorSummary()
-		poolN, poolFetched := m.PoolSummary()
 		// 默认跟挑节点的口径一致：开了"只用家宽"就不列机房节点。
 		// 带 all=1 能看到完整列表，用来确认过滤掉了多少。
 		if residentialOnly() && r.URL.Query().Get("all") != "1" {
@@ -221,14 +219,9 @@ func apiNodes(m *Manager) http.HandlerFunc {
 			"total":            total,
 			"available":        shown,
 			"residential_only": residentialOnly(),
-			// 最近一轮各源的结果与镜像列表缓存，用来判断聚合有没有在工作
-			"sources":        m.NodeSources(),
-			"mirror_count":   mirrors,
-			"mirror_fetched": mirrorFetched,
-			// 第三方滚动池（候选从 ~100 扩到 ~600 那个源）。它是 30 分钟一轮的
-			// 静态副本，所以单独标一份上游时间，不跟 fetched 混在一起
-			"pool_count":   poolN,
-			"pool_fetched": poolFetched,
+			// 最近一轮各源的结果（官方主站 + 聚合中心），用来判断拉取在工作。
+			// 聚合中心那一条的 Nodes 就是它单独贡献了多少个。
+			"sources": m.NodeSources(),
 		})
 	}
 }
@@ -318,16 +311,10 @@ func apiSwap(m *Manager) http.HandlerFunc {
 func apiRegions(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		_, fetched := m.Nodes()
-		mirrors, mirrorFetched := m.MirrorSummary()
-		poolN, poolFetched := m.PoolSummary()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"regions":        m.Regions(),
-			"fetched":        fetched,
-			"sources":        m.NodeSources(),
-			"mirror_count":   mirrors,
-			"mirror_fetched": mirrorFetched,
-			"pool_count":     poolN,
-			"pool_fetched":   poolFetched,
+			"regions": m.Regions(),
+			"fetched": fetched,
+			"sources": m.NodeSources(),
 		})
 	}
 }

@@ -167,8 +167,8 @@ func nodeAt(nodes []Node, host string) Node {
 	return Node{}
 }
 
-// 两边都有的节点要用主站（靠前的源）的元数据：镜像是缓存快照，
-// 实测 37/291 个节点的 Score/Ping/Speed 在镜像里是旧值。
+// 两边都有的节点要用主站（靠前的源）的元数据：第二个源是缓存快照，
+// 实测 37/291 个节点的 Score/Ping/Speed 在它那里是旧值。
 func TestMergeNodeSourcesPrefersEarlierSource(t *testing.T) {
 	main := []Node{
 		{HostName: "a", IP: "1.1.1.1", SpeedMbps: 10, Ping: 5},
@@ -344,7 +344,7 @@ func TestFetchAggregatedWorkerFallbackIsMainOnly(t *testing.T) {
 		t.Errorf("反代成功时主站不应记错: %+v", stats[0])
 	}
 	if stats[1].Err == "" {
-		t.Errorf("镜像失败要记下来: %+v", stats[1])
+		t.Errorf("第二个源失败要记下来: %+v", stats[1])
 	}
 }
 
@@ -436,7 +436,7 @@ func TestLiveNodeConfigCoverage(t *testing.T) {
 	}
 	none, noSession := 0, 0
 	for _, n := range nodes {
-		if n.Config == "" && n.RemoteConfig == nil {
+		if n.Config == "" {
 			none++
 		}
 		if n.Sessions == 0 {
@@ -445,7 +445,7 @@ func TestLiveNodeConfigCoverage(t *testing.T) {
 	}
 	t.Logf("源站列表 %d 个节点：没带 .ovpn 的 %d 个，sessions=0 的 %d 个", len(nodes), none, noSession)
 	for _, n := range nodes {
-		if n.Config == "" && n.RemoteConfig == nil {
+		if n.Config == "" {
 			t.Logf("  没配置的节点: %s %s %s 速度 %v Mbps", n.HostName, n.IP, n.CountryCode, n.SpeedMbps)
 		}
 	}

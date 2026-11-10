@@ -245,20 +245,10 @@ func TestOvpnKeepaliveDefaultWithoutEnv(t *testing.T) {
 	}
 }
 
-// 第三方池的节点（.ovpn 要去 CDN 现取）不能抢在源站实时节点前面。
-//
-// 节点列表是按速度降序合并的，池子那些“7 天快照里分数很高”的节点会插到
-// 实时节点前面；而它们只保证“六小时前 Cloudflare 边缘 TCP 探得过”。
-// 自动重连要的是能连回来，不是分数高。
-func TestCandidatesForPrefersLiveNodes(t *testing.T) {
-	ref := func(p string) *configRef {
-		return &configRef{Commit: strings.Repeat("a", 40), Path: p, SHA256: strings.Repeat("b", 64)}
-	}
+// 没带 .ovpn 的节点连不上（状态文件只写了一半、或者上游那一列缺了），
+// 不该占掉候选名额：试一个连不上的节点要 40 多秒，而一轮只有 6 个名额。
+func TestCandidatesForSkipsNodesWithoutConfig(t *testing.T) {
 	nodes := []Node{
-		{HostName: "vpn900001", CountryCode: "JP", SpeedMbps: 900, Residential: true, RemoteConfig: ref("pool/configs/1.json")},
-		{HostName: "vpn900002", CountryCode: "JP", SpeedMbps: 800, Residential: true, RemoteConfig: ref("pool/configs/2.json")},
-		// 分数最高，但既没内联 .ovpn 又没取数引用：这种节点连不上，
-		// 不该占掉一个候选名额（试一个要 40 多秒）
 		{HostName: "vpnbroken", CountryCode: "JP", SpeedMbps: 9999, Residential: true},
 		{HostName: "jp1", CountryCode: "JP", SpeedMbps: 300, Residential: true, Config: "client\nremote 1.1.1.1 443\n"},
 		{HostName: "jp2", CountryCode: "JP", SpeedMbps: 200, Residential: true, Config: "client\nremote 1.1.1.2 443\n"},
@@ -268,29 +258,9 @@ func TestCandidatesForPrefersLiveNodes(t *testing.T) {
 	tr := &Tunnel{Slot: 9, Node: Node{HostName: "jp0", CountryCode: "JP"}}
 
 	got := hostNames(m.candidatesFor(tr))
-	want := []string{"jp0", "jp1", "jp2", "vpn900001", "vpn900002"}
+	want := []string{"jp0", "jp1", "jp2"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("实时节点该排在池子节点前面，实际 %v", got)
-	}
-}
-
-// 实时节点不够时，池子节点要能补上来（不然接入这个源就没意义了）。
-func TestCandidatesForFallsBackToPoolNodes(t *testing.T) {
-	nodes := []Node{
-		{HostName: "jp1", CountryCode: "JP", SpeedMbps: 300, Residential: true, Config: "client\n"},
-		{HostName: "vpn900001", CountryCode: "JP", SpeedMbps: 900, Residential: true,
-			RemoteConfig: &configRef{Commit: strings.Repeat("a", 40), Path: "pool/configs/1.json", SHA256: strings.Repeat("b", 64)}},
-		{HostName: "vpn900002", CountryCode: "JP", SpeedMbps: 800, Residential: true,
-			RemoteConfig: &configRef{Commit: strings.Repeat("a", 40), Path: "pool/configs/2.json", SHA256: strings.Repeat("b", 64)}},
-	}
-	m := mgrWith(nodes)
-	tr := &Tunnel{Slot: 9, Node: Node{HostName: "jp0", CountryCode: "JP"}}
-	tr.markAutoFail("jp1") // 唯一的实时节点刚连不上
-
-	got := hostNames(m.candidatesFor(tr))
-	want := []string{"jp0", "vpn900001", "vpn900002"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("实时节点被挡掉时应该用池子节点，实际 %v", got)
+		t.Errorf("缺配置的节点不该进候选，实际 %v", got)
 	}
 }
 

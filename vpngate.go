@@ -41,6 +41,25 @@ func mirrorAccessKey() string {
 	return mirrorKey
 }
 
+// csvMaxBytes 是单个节点列表响应的体积上限。官方 CSV 实测 ~1.33 MB，
+// 超出这个数就是响应被截断（反代吞半截）或者被换成了其什么大的东西，
+// 两种都不能当正常名单用。聚合中心那条源自己有上限与行数校验（见 aggsource.go）。
+const csvMaxBytes = 4 << 20
+
+// nodeTransport 是拉官方节点列表与其反代兜底共用的传输层。
+//
+// DisableCompression 不是优化，是必需的：官方源对带 `Accept-Encoding: gzip`
+// 的请求会先回 200 再一个字节都不发，一直挂到客户端超时（同一个 URL 用 curl
+// 不带这个头，1.3 MB 几秒拉完）。Go 的默认 Transport 会自动加这个头，
+// 不关掉就等于这条源永远失败。CSV 本来就是纯文本，压不压差不了多少。
+//
+// 自家聚合中心不用这个 transport：那是自己的服务，gzip 能省一半以上流量。
+var nodeTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DisableCompression = true
+	return t
+}()
+
 // Node 是一个 VPN Gate 节点。
 type Node struct {
 	HostName    string  `json:"hostname"`
@@ -51,22 +70,8 @@ type Node struct {
 	SpeedMbps   float64 `json:"speed_mbps"`
 	Sessions    int     `json:"sessions"`
 	Config      string  `json:"-"` // 解码后的 .ovpn 内容
-	// RemoteConfig 非空表示 .ovpn 不在这份列表里，要按这个引用去取。
-	// 第三方滚动池是每个节点一个文件（按 sha256 分），全部内联就是 50MB，
-	// 而实际只有真要连的那个节点才用得上，所以懒加载。
-	RemoteConfig *configRef `json:"-"`
 	// Residential 表示这是志愿者的家庭宽带，不是 VPN Gate 自己的机房服务器。
 	Residential bool `json:"residential"`
-}
-
-// configRef 是一份 .ovpn 在第三方节点池里的位置。
-//
-// Commit 必须存下来：列表是 commit A 的、config 去拿 commit B 的话，
-// 路径里的 sha256 可能对不上，也可能拿到另一个节点的配置。
-type configRef struct {
-	Commit string
-	Path   string
-	SHA256 string
 }
 
 // vpngate 自营服务器所在的网段。这些是学术网络里的机房机器，
@@ -102,7 +107,7 @@ func isResidential(hostName, ip string) bool {
 // 先直连；连不上或者拿回来的内容不对（被拦截、返回门户页）就换反代再试一次。
 // 返回的列表已按速度降序排列。
 //
-// 启动时走这条路（同步、不拉镜像，不拖慢隧道恢复）；
+// 启动时走这条路（同步、只拉主站，不拖慢隧道恢复）；
 // 运行期的多源聚合走 fetchAggregated。
 func fetchNodes(timeout time.Duration) ([]Node, error) {
 	return fetchNodesWith(vpngateAPI, timeout)
@@ -175,8 +180,8 @@ type sourceStat struct {
 	Err   string `json:"err,omitempty"`
 }
 
-// 并发 3：主站 + 2 个镜像一个波次拉完，最坏就是一个单源超时。
-// 并发 2 会多出一个波次，最坏耗时翻倍，而 3 个并发对上游不构成压力。
+// 并发 3：现在官方 CSV 源只有主站那一个（失败退自建反代），并发数是为
+// 以后再加源留的。真并发起来最坏就是一个单源超时，不会变成两个波次。
 const maxSourceWorkers = 3
 
 // csvHeadLine 返第一个非空行（去 BOM）以及它是不是 VPN Gate 的开头标记。
@@ -279,7 +284,7 @@ func nodeCountPlausible(n, prev int) error {
 
 // mergeNodeSources 按 hostname 去重合并，靠前的源优先。
 //
-// 主站是实时生成的，镜像是缓存快照：实测 37/291 个节点在镜像里的
+// 主站是实时生成的，聚合中心的名单是它自己那台机器某一刻的快照：
 // Score/Ping/Speed 与主站不一致且是旧值，所以两边都有时要用主站的。
 // 实测 7 个源里 hostname 与 IP 一一对应（多 IP 数 = 0），所以拿 hostname
 // 当键是安全的；真撞上不一致就沿用优先级高的那条，不去猜。

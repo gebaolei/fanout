@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,22 +22,20 @@ func useMainFeed(t *testing.T, url string) {
 	t.Cleanup(func() { vpngateAPI = old })
 }
 
-// noMirrors 关掉两个额外源：官方镜像与第三方节点池。
+// noAgg 关掉两个额外源：自建反代兜底与聚合中心。
 //
-// 这些测试只关心 CSV 多源聚合本身。不关池源的话，它会真去打 GitHub
-// （慢、而且把“全部源失败”的用例变成“有货”），选源与去重的行为在
-// mirrors_test.go 里覆盖，合并行为在 vpngate_test.go 里，池源自己在
-// poolsource_test.go 里覆盖。
-func noMirrors(t *testing.T) {
+// 这些测试只关心官方 CSV 这条路径本身。不关聚合中心的话它会真去连
+// FANOUT_AGG_API（慢，而且会把“全部源失败”的用例变成“有货”）；
+// 聚合中心自己的行为在 aggsource_test.go 里覆盖，合并行为在下面覆盖。
+func noAgg(t *testing.T) {
 	t.Helper()
-	t.Setenv("FANOUT_VPNGATE_SOURCES", "0")
 	t.Setenv("FANOUT_VPNGATE_MIRROR", "")
-	t.Setenv("FANOUT_VPNGATE_POOL", "")
+	t.Setenv("FANOUT_AGG_API", "")
 }
 
 // 全部源失败时必须保留上一轮列表。这个语义改动前就有，多源后不能丢。
 func TestRefreshNodesKeepsPreviousListWhenAllFail(t *testing.T) {
-	noMirrors(t)
+	noAgg(t)
 	useMainFeed(t, statusServer(t, 403).URL)
 
 	m := NewManager(20, t.TempDir())
@@ -59,7 +59,7 @@ func TestRefreshNodesKeepsPreviousListWhenAllFail(t *testing.T) {
 }
 
 func TestRefreshNodesSuccessRecordsStats(t *testing.T) {
-	noMirrors(t)
+	noAgg(t)
 	main := csvServer(t, sampleNodeCSVN("m", 24))
 	useMainFeed(t, main.URL)
 
@@ -82,7 +82,7 @@ func TestRefreshNodesSuccessRecordsStats(t *testing.T) {
 
 // 启动路径用的单源刷新：不碰多源，也不写 stats（那一轮还没有多源数据）。
 func TestRefreshMainNodesIsSingleSource(t *testing.T) {
-	noMirrors(t)
+	noAgg(t)
 	main := csvServer(t, sampleNodeCSVN("m", 20))
 	useMainFeed(t, main.URL)
 
@@ -108,30 +108,107 @@ func TestRefreshMainNodesIsSingleSource(t *testing.T) {
 	}
 }
 
-// NewManager 会读 workDir/mirrors.json，重启后不必等网络就有一版镜像列表。
-func TestNewManagerLoadsCachedMirrors(t *testing.T) {
-	dir := t.TempDir()
-	if err := saveMirrors(dir, []mirrorEntry{{Base: "http://203.113.1.7:8080", Location: "Nowhere"}}); err != nil {
+// 聚合中心的节点要跟官方主站的合并，同名节点沿用主站那一份。
+//
+// 主站是实时生成的，agg 的池子是它自己那台机器某一轮拉下的快照：实测同一个
+// 节点在两处的 Ping/Speed 会不一致，且 agg 那份是旧值。
+func TestRefreshNodesMergesAggSource(t *testing.T) {
+	t.Setenv("FANOUT_VPNGATE_MIRROR", "")
+	main := csvServer(t, sampleNodeCSVN("m", 30))
+	useMainFeed(t, main.URL)
+
+	f := newAggFixture(t, 40)
+	f.wantAuth = "Bearer " + f.token
+	// 两个与主站同名的节点，但带的是旧值：合并时必须沿用主站那份
+	oldCfg := base64.StdEncoding.EncodeToString([]byte("client\nremote 9.9.9.9 443\n"))
+	for i := 0; i < 2; i++ {
+		f.rows[i].HostName = fmt.Sprintf("m%d", i+1)
+		f.rows[i].Ping = 999
+		f.rows[i].OpenVPNConfigB64 = oldCfg
+	}
+
+	m := NewManager(20, t.TempDir())
+	n, err := m.RefreshNodes()
+	if err != nil {
 		t.Fatal(err)
 	}
-	m := NewManager(20, dir)
-	n, at := m.MirrorSummary()
-	if n != 1 || at.IsZero() {
-		t.Fatalf("没读回缓存的镜像列表: %d %v", n, at)
+	if n != 30+40-2 {
+		t.Errorf("去重后应当是 68 个，实际 %d", n)
 	}
-	// 让缓存过期后列表页又拉不通：还得沿用盘上这份，而不是退回单源
-	m.mirrors.portBusy = func(int) bool { return false }
-	m.mirrors.fetched = time.Now().Add(-(mirrorListMaxAge + time.Hour))
-	t.Setenv("FANOUT_VPNGATE_SITES", statusServer(t, 404).URL)
-	if got := m.mirrors.sources(time.Now(), time.Second); len(got) != 2 {
-		t.Fatalf("应当沿用缓存的镜像: %v", got)
+	for _, node := range m.nodes {
+		if node.HostName == "m1" || node.HostName == "m2" {
+			if node.Ping != 20 {
+				t.Errorf("同名节点应当沿用主站那份（Ping 20），实际 %d", node.Ping)
+			}
+		}
+	}
+	stats := m.NodeSources()
+	if len(stats) != 2 {
+		t.Fatalf("主站与聚合中心各一条统计，实际 %+v", stats)
+	}
+}
+
+// 聚合中心挂了不影响这一轮：主站有货就算成功，但统计里要留下失败原因。
+// 不写这一行，界面上就只能看到“源 1/2”却不知道另一个为什么挂。
+func TestRefreshNodesSurvivesAggFailure(t *testing.T) {
+	t.Setenv("FANOUT_VPNGATE_MIRROR", "")
+	main := csvServer(t, sampleNodeCSVN("m", 30))
+	useMainFeed(t, main.URL)
+
+	f := newAggFixture(t, 30)
+	f.status = http.StatusTooManyRequests
+
+	m := NewManager(20, t.TempDir())
+	n, err := m.RefreshNodes()
+	if err != nil {
+		t.Fatalf("聚合中心挂了不该让整轮失败: %v", err)
+	}
+	if n != 30 {
+		t.Errorf("应当只拿到主站的 30 个，实际 %d", n)
+	}
+	stats := m.NodeSources()
+	var agg *sourceStat
+	for i, s := range stats {
+		if strings.Contains(s.URL, "vpngate/api/iphone/") && !strings.Contains(s.URL, "www.vpngate.net") {
+			agg = &stats[i]
+		}
+	}
+	if agg == nil {
+		t.Fatalf("统计里应当有聚合中心那一条，哪怕它挂了: %+v", stats)
+	}
+	if !strings.Contains(agg.Err, "429") {
+		t.Errorf("那一条要记下失败原因，实际 %q", agg.Err)
+	}
+}
+
+// 官方源全部失败（主站限流时真会这样）时，聚合中心要能顶上。
+// 列表会比官方名单旧一点（agg 自己 60 分钟一轮），但比空列表强。
+func TestRefreshNodesFallsBackToAggWhenMainFails(t *testing.T) {
+	t.Setenv("FANOUT_VPNGATE_MIRROR", "")
+	useMainFeed(t, statusServer(t, 403).URL)
+
+	f := newAggFixture(t, 35)
+	f.wantAuth = "Bearer " + f.token
+
+	m := NewManager(20, t.TempDir())
+	m.nodes = []Node{{HostName: "keep-me", CountryCode: "JP", Residential: true}}
+
+	n, err := m.RefreshNodes()
+	if err != nil {
+		t.Fatalf("官方源挂了、聚合中心有货，不该报错: %v", err)
+	}
+	if n != 35 {
+		t.Errorf("应当拿聚合中心的 35 个顶上，实际 %d", n)
+	}
+	if has(m.nodes, "keep-me") {
+		t.Error("有更新的列表可用时不该继续沿用旧列表")
 	}
 }
 
 // 启动后的后台聚合、12 小时 ticker、重连退避前的刷新、手动接口可能撞在一起。
 // 开 -race 同跑几轮，确认不会互相踩到写出半份列表。
 func TestConcurrentRefreshDoesNotTearTheList(t *testing.T) {
-	noMirrors(t)
+	noAgg(t)
 	main := csvServer(t, sampleNodeCSVN("m", 30))
 	useMainFeed(t, main.URL)
 
@@ -159,7 +236,7 @@ func TestConcurrentRefreshDoesNotTearTheList(t *testing.T) {
 // 重连循环里的刷新必须受冷却控制：一条连不上的隧道每轮重试都刷一轮的话，
 // 一小时上百次请求会把主站和自建反代打进限流，真需要刷新时反而刷不动。
 func TestRetryRefreshHonoursCooldown(t *testing.T) {
-	noMirrors(t)
+	noAgg(t)
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -188,7 +265,7 @@ func TestRetryRefreshHonoursCooldown(t *testing.T) {
 // 全部源失败时 m.fetched 不会更新，冷却必须记在“发起过拉取”上。
 // 否则主站被限流的那段时间会被越打越凶 —— 正是现场看到的那个问题。
 func TestRetryRefreshCooldownSurvivesTotalFailure(t *testing.T) {
-	noMirrors(t)
+	noAgg(t)
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -214,7 +291,7 @@ func TestRetryRefreshCooldownSurvivesTotalFailure(t *testing.T) {
 //
 //	FANOUT_LIVE_TEST=1 FANOUT_VPNGATE_TIMEOUT=60s go test -run TestLiveRefreshNodes -v
 //
-// 部分镜像不通不算失败（那正是要在目标机器上看的），但合并结果必须过
+// 个别源不通不算失败（那正是要在目标机器上看的），但合并结果必须过
 // 最低节点数，否则等于聚合白做。
 func TestLiveRefreshNodes(t *testing.T) {
 	if os.Getenv("FANOUT_LIVE_TEST") == "" {
@@ -232,8 +309,7 @@ func TestLiveRefreshNodes(t *testing.T) {
 		}
 		t.Logf("  源 %s OK：%d 个节点（%dms）", s.URL, s.Nodes, s.MS)
 	}
-	mirrors, _ := m.MirrorSummary()
-	t.Logf("合并后 %d 个节点，镜像列表缓存 %d 个", n, mirrors)
+	t.Logf("合并后 %d 个节点", n)
 	if n < minNodesPerSource {
 		t.Errorf("合并后只有 %d 个节点，不对", n)
 	}

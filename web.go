@@ -257,7 +257,7 @@ textarea:focus{outline:none;border-color:var(--accent)}
         <div class="regions" id="regions" style="margin-top:6px"></div>
       </label>
       <div class="hint" id="rgfetched"></div>
-      <button id="rgrefresh" title="重新拉取 VPN Gate 节点列表（主站 + 镜像）">
+      <button id="rgrefresh" title="重新拉取节点列表（VPN Gate 主站 + 聚合中心）">
         <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
         刷新节点列表
       </button>
@@ -888,7 +888,7 @@ $('#ncreate').onclick = async e => {
 
 $('#rgfilter').oninput = renderRegions;
 
-// 节点列表新鲜度。多源聚合后池子会随轮转变化，不显示上次拉取时间与
+// 节点列表新鲜度。候选量主要靠聚合中心，不显示上次拉取时间与
 // 各源成败，用户就分不清“这个地区多了很多候选”是刷新带来的还是列表过期了。
 function showFetched(r){
   const el = $('#rgfetched');
@@ -898,10 +898,10 @@ function showFetched(r){
   const src = r.sources || [];
   const bits = ['节点列表 ' + new Date(iso).toLocaleString()];
   if(src.length) bits.push('源 ' + src.filter(s => !s.err).length + '/' + src.length);
-  if(r.mirror_count) bits.push('镜像 ' + r.mirror_count + ' 个');
-  // 第三方滚动池的可用节点数。单独标是因为它是 30 分钟一轮的副本，
-  // 新鲜度不能跟上面那个“节点列表”时间混为一谈
-  if(r.pool_count) bits.push('池 ' + r.pool_count + ' 个');
+  // 聚合中心那一条单独标个数：候选量几乎全靠它。它挂了的话池子会从一千多
+  // 掉到八十来个，只看“源 1/2”根本看不出来出了什么事
+  const agg = src.find(s => /\/vpngate\/api\/iphone\//.test(s.url || '') && !/www\.vpngate\.net/.test(s.url || ''));
+  if(agg) bits.push(agg.err ? '聚合中心拉不到' : '聚合中心 ' + agg.nodes + ' 个');
   el.textContent = bits.join(' · ');
 }
 

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -136,27 +135,27 @@ func containsStr(s, sub string) bool {
 	return false
 }
 
-// 跑在第三方池节点上的隧道，重启后还要能取到 .ovpn。
+// 跑在聚合中心节点上的隧道，重启后还要能连回来。
 //
-// 池子列表只是一个 commit 的快照，重启后这个节点可能已经不在列表里；而它的
-// .ovpn 不像源站节点那样内联在列表里。不存引用的话，恢复出来就是一个空
-// Config，永远连不上 —— 真机上那个"候选 vpn200460917 连不上：没有 .ovpn
-// 配置"的死候选就是这么来的。
-func TestSaveStateKeepsPoolConfigRef(t *testing.T) {
+// 聚合中心的名单只是一轮快照，重启后这个节点可能已经不在列表里。它的
+// .ovpn 是内联在每一行里的，所以 saveState 必须把 Config 存下来：
+// 不存的话恢复出来就是一个空 Config，永远连不上 —— 真机上那个
+// “候选 vpn200460917 连不上：没有 .ovpn 配置”的死候选就是这么来的。
+func TestSaveStateKeepsInlineConfig(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(20, dir)
+	const cfg = "client\nremote 203.0.113.9 443\n"
 	tn := &Tunnel{
 		Slot: 4, Port: 22059, Status: "up",
 		Cred: SocksCred{User: "u", Pass: "p"},
-		Node: Node{HostName: "vpn900001", CountryCode: "US",
-			RemoteConfig: &configRef{Commit: strings.Repeat("a", 40), Path: "pool/configs/x.json", SHA256: strings.Repeat("b", 64)}},
+		Node: Node{HostName: "vpn900001", CountryCode: "US", Config: cfg},
 	}
 	m.tunnels[4] = tn
 	if err := m.saveState(); err != nil {
 		t.Fatal(err)
 	}
 
-	// 换个 manager 从盘上读，并且当前列表里没有这个节点（模拟它已从池子里过期）
+	// 换个 manager 从盘上读，并且当前列表里没有这个节点（模拟它已从名单里消失）
 	m2 := NewManager(20, dir)
 	if _, err := m2.restoreState(); err != nil {
 		t.Fatal(err)
@@ -168,44 +167,17 @@ func TestSaveStateKeepsPoolConfigRef(t *testing.T) {
 		t.Fatal("隧道没恢复出来")
 	}
 	got.Status = "stopped"
-	if got.Node.RemoteConfig == nil {
-		t.Fatal("池子节点的 .ovpn 引用没跟着状态落盘")
+	if got.Node.Config != cfg {
+		t.Errorf(".ovpn 应当跟着状态落盘，实际 %q", got.Node.Config)
 	}
-	ref := got.Node.RemoteConfig
-	if ref.Commit != strings.Repeat("a", 40) || ref.Path != "pool/configs/x.json" || ref.SHA256 != strings.Repeat("b", 64) {
-		t.Errorf("落盘的引用不完整: %+v", ref)
-	}
-}
-
-// 存盘那一刻 .ovpn 还没取到（上一轮重连刚把候选换成池子节点就被重启），
-// 恢复后要能照存盘的引用把配置取回来，而不是变成一个连不上的死候选。
-func TestRestoreStateRebuildsMissingConfigFromRef(t *testing.T) {
-	dir := t.TempDir()
-	blob := `{"tunnels":[{"slot":4,"port":22059,"hostname":"vpn900001","country_code":"US","config":"",` +
-		`"config_commit":"` + strings.Repeat("a", 40) + `","config_path":"pool/configs/x.json",` +
-		`"config_sha256":"` + strings.Repeat("b", 64) + `","socks_user":"u","socks_pass":"p"}]}`
-	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(blob), 0600); err != nil {
-		t.Fatal(err)
-	}
-	m := NewManager(20, dir)
-	if _, err := m.restoreState(); err != nil {
-		t.Fatal(err)
-	}
-	m.mu.RLock()
-	tn := m.tunnels[4]
-	m.mu.RUnlock()
-	tn.Status = "stopped"
-	if tn.Node.RemoteConfig == nil {
-		t.Fatal("空 Config + 存盘引用应当能恢复出取数入口")
-	}
-	if tn.autoAvoid(time.Now())[tn.Node.HostName] {
-		t.Error("能靠引用取到配置的节点不该被当成死候选")
+	if got.Node.CountryCode != "US" {
+		t.Errorf("地区也得存，不然重连时同区候选无从谈起: %+v", got.Node)
 	}
 }
 
-// 既没有 .ovpn 又没有引用（老状态文件，或者那个池子节点已经过期）：
+// 存盘那一刻 Config 是空的（写盘只做到一半，或者上游那一列缺了）：
 // 这种节点永远连不上，却会占掉一个候选名额（一次 40 多秒）和 6 分钟黑名单。
-// 直接当"刚连不上"处理，让同地区其他节点顶上来。
+// 直接当“刚连不上”处理，让同地区其他节点顶上来。
 func TestRestoreStateWithoutAnyConfigSkipsCandidate(t *testing.T) {
 	dir := t.TempDir()
 	blob := `{"tunnels":[{"slot":4,"port":22059,"hostname":"vpn-gone","country_code":"US","config":"",` +
